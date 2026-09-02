@@ -1,0 +1,2453 @@
+// Forward declarations placed before Arduino headers so the Arduino sketch
+// prototype generator knows these UI animation types before it emits function prototypes.
+struct SmoothScrollState;
+struct SlideState;
+struct CarouselState;
+
+#include "U8glib.h"
+#include <EEPROM.h>
+#include <string.h>
+#include <avr/pgmspace.h>
+#include <stdarg.h>
+
+U8GLIB_SSD1306_128X64 u8g(U8G_I2C_OPT_DEV_0 | U8G_I2C_OPT_NO_ACK | U8G_I2C_OPT_FAST);
+
+#define CE_PIN   7
+#define CSN_PIN  8
+#define MOSI_PIN 3
+#define MISO_PIN 2
+#define SCK_PIN  13
+
+#define POT_PIN     A0
+#define JoyContY    A1
+#define JoyContX    A2
+#define JoySpeedX   A3
+#define LeftPadButtons A6
+#define RightPadButtons A7
+#define Toggle1     4
+#define Toggle2     5
+#define Toggle3     6
+#define Toggle4     1
+
+struct __attribute__((packed)) TransmitterData {
+  uint16_t channels[8];
+  bool toggles[4];
+  bool buttons[8];
+  uint32_t servoMapPacked;
+};
+
+struct __attribute__((packed)) TelemetryData {
+  uint16_t batteryMv;
+  uint8_t batteryPercent;
+  uint8_t flags;
+  uint32_t packetCount;
+  uint16_t currentCentiAmp;
+  uint16_t consumedMah;
+  uint8_t linkQuality;
+  uint8_t state;
+  int8_t rollDeg;
+  int8_t pitchDeg;
+  uint8_t calibrationProgress;
+};
+
+static_assert(sizeof(TelemetryData) == 17, "TelemetryData must be 17 bytes");
+
+static_assert(sizeof(TransmitterData) == 32, "TransmitterData must be 32 bytes");
+
+const uint8_t arduino_tx_addr[5] = {0x58, 0x70, 0x40, 0x32, 0x37};
+const uint8_t arduino_rx_addr[5] = {0x58, 0x70, 0x40, 0x32, 0x37};
+
+TransmitterData txData;
+TelemetryData telemetryData;
+uint8_t lastValidBatteryPerc = 0;
+
+bool radioConnected = false;
+bool telemetryReceived = false;
+bool ackDynamicEnabled = false;
+unsigned long packetCount = 0;
+unsigned long lastTelemetryTime = 0;
+unsigned long lastTelemetryReceive = 0;
+unsigned long lastDisplayUpdate = 0;
+unsigned long displayFrameStart = 0;
+unsigned long displayLastProgress = 0;
+unsigned long displayLastInitAttempt = 0;
+bool displayRendering = false;
+bool displayInitialized = false;
+uint8_t displayScreenSnapshot = 0;
+const unsigned long LINK_TIMEOUT = 3000;
+
+const unsigned long DISPLAY_INTERVAL = 80UL;
+const unsigned long DISPLAY_FRAME_TIMEOUT = 300UL;
+const unsigned long DISPLAY_REINIT_RETRY = 750UL;
+uint16_t linkAttempts = 0;
+uint32_t linkScoreSum = 0;
+uint8_t lastRetryCount = 0;
+uint8_t linkQuality = 0;
+unsigned long lastLinkQualityUpdate = 0;
+unsigned long lastControlSendUs = 0;
+unsigned long lastInputUpdateUs = 0;
+const unsigned long INPUT_UPDATE_INTERVAL_US = 2000UL;
+unsigned long radioBootMs = 0;
+unsigned long radioPowerUpMs = 0;
+bool radioConfigured = false;
+bool radioReady = false;
+const unsigned long CONTROL_SEND_INTERVAL_US = 10000UL;
+bool radioTxBusy = false;
+unsigned long radioTxStartUs = 0;
+enum RadioState : uint8_t { RADIO_IDLE=0, RADIO_CE_PULSE, RADIO_WAIT_TX };
+RadioState radioState = RADIO_IDLE;
+
+
+int rawCX = 512, rawCY = 512, rawThr = 0, rawPot = 0;
+
+int speedMin = 0, speedMax = 1023;
+int potMin = 0, potMax = 1023;
+int centerX = 512, centerY = 512;
+
+const int DEADZONE_X = 8, DEADZONE_Y = 8;
+
+const int CONTROL_START_COUNTS = 36;
+
+const int MIN_EXPO_LINEAR_PERCENT = 35;
+
+bool buttonLeftUp = false, buttonLeftLeft = false, buttonLeftRight = false, buttonLeftDown = false;
+bool buttonRightUp = false, buttonRightLeft = false, buttonRightRight = false, buttonRightDown = false;
+
+enum FlightMode { MODE_MANUAL = 0, MODE_STABILIZE = 1, MODE_ACRO = 2 };
+uint8_t flightMode = MODE_MANUAL;
+bool gearDown = false;
+uint8_t flapPosition = 0;
+
+bool lastToggle1 = false, lastToggle2 = false, lastToggle3 = false, lastToggle4 = false;
+
+enum PlaneType { PLANE_WING = 0, PLANE_NORMAL = 1, PLANE_V_TAIL = 2 };
+uint8_t plane_type = PLANE_WING;
+
+#define SCREEN_MENU 0
+#define SCREEN_DASHBOARD 1
+#define SCREEN_DUAL_RATES 2
+#define SCREEN_ALL_TRIMS 3
+#define SCREEN_PLANE_TYPE 4
+#define SCREEN_SERVO_ASSIGN 5
+#define SCREEN_SAVE_SETTINGS 6
+#define SCREEN_SERVO_MIX 7
+
+const uint8_t NUM_ITEMS = 6;
+
+// UI labels live in flash, not SRAM. This removes the large RAM-resident
+// menu/string tables that were responsible for most of the low-memory warning.
+static const char ui_menu0[] PROGMEM = "Dashboard";
+static const char ui_menu1[] PROGMEM = "Rates / Expo";
+static const char ui_menu2[] PROGMEM = "Trims";
+static const char ui_menu3[] PROGMEM = "Plane / Servo";
+static const char ui_menu4[] PROGMEM = "Servo Reverse";
+static const char ui_menu5[] PROGMEM = "Save / Reset";
+static const char* const ui_menu_table[] PROGMEM = {
+  ui_menu0, ui_menu1, ui_menu2, ui_menu3, ui_menu4, ui_menu5
+};
+
+uint8_t current_screen = SCREEN_MENU;
+int8_t item_selected = 0;
+
+int8_t trim_aileron = 0, trim_elevator = 0, trim_rudder = 0, trim_flaps = 0;
+uint8_t rate_value = 80, expo_value = 30;
+bool trim_adjust_mode = false;
+uint8_t trim_selection = 0;
+
+bool menu_up_pressed = false, menu_down_pressed = false, menu_select_pressed = false, menu_exit_pressed = false;
+bool trim_lu_latch=false, trim_ld_latch=false, trim_rl_latch=false, trim_rr_latch=false;
+bool trim_exit_latch=false;
+
+bool servo_output_dec_latch = false;
+bool servo_output_inc_latch = false;
+bool servo_back_latch = false;
+
+int8_t servo_assign_selection = 0;
+const uint8_t NUM_SERVOS = 8;
+static const char ui_srv0[] PROGMEM = "Aileron";
+static const char ui_srv1[] PROGMEM = "Elevator";
+static const char ui_srv2[] PROGMEM = "Throttle";
+static const char ui_srv3[] PROGMEM = "Rudder";
+static const char ui_srv4[] PROGMEM = "Flaps";
+static const char ui_srv5[] PROGMEM = "Gear";
+static const char ui_srv6[] PROGMEM = "Aux1";
+static const char ui_srv7[] PROGMEM = "Aux2";
+static const char* const ui_servo_table[] PROGMEM = {
+  ui_srv0, ui_srv1, ui_srv2, ui_srv3, ui_srv4, ui_srv5, ui_srv6, ui_srv7
+};
+static const char ui_out0[] PROGMEM = "S1";
+static const char ui_out1[] PROGMEM = "S2";
+static const char ui_out2[] PROGMEM = "S3";
+static const char ui_out3[] PROGMEM = "S4";
+static const char ui_out4[] PROGMEM = "S5";
+static const char ui_out5[] PROGMEM = "S6";
+static const char ui_out6[] PROGMEM = "MOTOR";
+static const char ui_out7[] PROGMEM = "NONE";
+static const char* const ui_output_table[] PROGMEM = {
+  ui_out0, ui_out1, ui_out2, ui_out3, ui_out4, ui_out5, ui_out6, ui_out7
+};
+
+// One shared UI scratch buffer replaces many global/string RAM allocations.
+static char uiText[24];
+
+static void loadFlashText(PGM_P p) {
+  strncpy_P(uiText, p, sizeof(uiText) - 1U);
+  uiText[sizeof(uiText) - 1U] = '\0';
+}
+
+static void loadFlashTable(const char* const* table, uint8_t index) {
+  PGM_P p = (PGM_P)pgm_read_word(&table[index]);
+  loadFlashText(p);
+}
+
+uint8_t servo_channel_map[8] = {7, 7, 7, 7, 7, 7, 7, 7};
+
+// Physical servo reversing. Bits 0..5 correspond to S1..S6.
+// MOTOR is intentionally excluded from reversing for safety.
+uint8_t servo_reverse_mask = 0;
+int8_t servo_reverse_selection = 0;
+bool servo_reverse_toggle_latch = false;
+bool servo_reverse_back_latch = false;
+
+// Save/reset screen state. Reset uses a confirmation step to avoid accidental wipes.
+bool settings_reset_latch = false;
+bool settings_reset_confirm = false;
+
+#define CONFIG      0x00
+#define EN_AA       0x01
+#define EN_RXADDR   0x02
+#define SETUP_AW    0x03
+#define SETUP_RETR  0x04
+#define RF_CH       0x05
+#define RF_SETUP    0x06
+#define STATUS      0x07
+#define OBSERVE_TX  0x08
+#define RX_ADDR_P0  0x0A
+#define TX_ADDR     0x10
+#define RX_PW_P0    0x11
+#define DYNPD       0x1C
+#define FEATURE     0x1D
+#define FIFO_STATUS 0x17
+
+#define R_REGISTER    0x00
+#define W_REGISTER    0x20
+#define R_RX_PAYLOAD  0x61
+#define R_RX_PL_WID   0x60
+#define W_TX_PAYLOAD  0xA0
+#define ACTIVATE      0x50
+#define FLUSH_TX      0xE1
+#define FLUSH_RX      0xE2
+#define NOP           0xFF
+
+#define EEPROM_MAGIC 0x6B
+#define EEPROM_REVERSE_MAGIC 0xA7
+#define EEPROM_ADDR 0
+
+struct SavedSettings {
+  uint8_t magic;
+  int trim_aileron;
+  int trim_elevator;
+  int trim_rudder;
+  int trim_flaps;
+  int rate_value;
+  int expo_value;
+  int plane_type;
+  uint8_t servo_channel_map[8];
+  uint8_t reverse_magic;
+  uint8_t servo_reverse_mask;
+};
+
+SavedSettings savedSettings;
+
+void saveSettings();
+void resetSettingsToDefaults();
+void updatePlaneServoMap();
+void updateControlInputsFast();
+
+uint8_t planeVisibleCount() {
+  return (plane_type == PLANE_WING) ? 6 : 8;
+}
+
+uint8_t planeLogicalId(uint8_t i) {
+  if (plane_type == PLANE_WING) {
+    static const uint8_t map6[6] PROGMEM = {0,2,4,5,6,7};
+    if (i > 5) i = 5;
+    return pgm_read_byte(&map6[i]);
+  }
+
+  if (plane_type == PLANE_V_TAIL) {
+    static const uint8_t map8[8] PROGMEM = {0,1,3,2,4,5,6,7};
+    if (i > 7) i = 7;
+    return pgm_read_byte(&map8[i]);
+  }
+
+  return (i > 7) ? 7 : i;
+}
+
+const char* planeFunctionName(uint8_t i) {
+  if (plane_type == PLANE_V_TAIL) {
+    if (i == 1) { loadFlashText(PSTR("RV-L")); return uiText; }
+    if (i == 2) { loadFlashText(PSTR("RV-R")); return uiText; }
+  }
+  loadFlashTable(ui_servo_table, planeLogicalId(i));
+  return uiText;
+}
+
+static const char* physicalOutputName(uint8_t output) {
+  if (output > 7U) output = 7U;
+  loadFlashTable(ui_output_table, output);
+  return uiText;
+}
+
+void sanitizePlaneMap() {
+  if (plane_type == PLANE_WING) {
+    servo_channel_map[1] = 7;
+    servo_channel_map[3] = 7;
+  }
+}
+
+bool servoOutputUsedByOther(uint8_t logicalId, uint8_t channel) {
+  if (channel >= 7) return false;
+
+  uint8_t count = planeVisibleCount();
+  for (uint8_t i = 0; i < count; i++) {
+    uint8_t otherId = planeLogicalId(i);
+    if (otherId != logicalId && servo_channel_map[otherId] == channel) {
+      return true;
+    }
+  }
+  return false;
+}
+
+uint8_t findNextFreeServoOutput(uint8_t logicalId, int8_t direction) {
+  int current = constrain(servo_channel_map[logicalId], 0, 7);
+  int candidate = current;
+
+  for (uint8_t tries = 0; tries < 8; tries++) {
+    candidate += direction;
+    if (candidate > 7) candidate = 0;
+    if (candidate < 0) candidate = 7;
+
+    if (candidate == 7 || !servoOutputUsedByOther(logicalId, (uint8_t)candidate)) {
+      return (uint8_t)candidate;
+    }
+  }
+
+  return (uint8_t)current;
+}
+
+void softSPI_init() {
+  pinMode(MOSI_PIN, OUTPUT);
+  pinMode(MISO_PIN, INPUT);
+  pinMode(SCK_PIN, OUTPUT);
+  pinMode(CSN_PIN, OUTPUT);
+  pinMode(CE_PIN, OUTPUT);
+
+  PORTB |= _BV(PB0);
+  PORTD &= ~_BV(PD7);
+  PORTB &= ~_BV(PB5);
+}
+
+static inline void nrf_csn_low()  { PORTB &= ~_BV(PB0); }
+static inline void nrf_csn_high() { PORTB |=  _BV(PB0); }
+static inline void nrf_ce_low()   { PORTD &= ~_BV(PD7); }
+static inline void nrf_ce_high()  { PORTD |=  _BV(PD7); }
+
+uint8_t softSPI_transfer(uint8_t data) {
+  uint8_t received = 0;
+  for (uint8_t mask = 0x80; mask; mask >>= 1) {
+    if (data & mask) PORTD |= _BV(PD3);
+    else             PORTD &= ~_BV(PD3);
+
+    PORTB |= _BV(PB5);
+    if (PIND & _BV(PD2)) received |= mask;
+    PORTB &= ~_BV(PB5);
+  }
+  return received;
+}
+
+uint8_t read_register(uint8_t reg) {
+  nrf_csn_low();
+  softSPI_transfer(R_REGISTER | (reg & 0x1F));
+  uint8_t value = softSPI_transfer(NOP);
+  nrf_csn_high();
+  return value;
+}
+
+void write_register(uint8_t reg, uint8_t value) {
+  nrf_csn_low();
+  softSPI_transfer(W_REGISTER | (reg & 0x1F));
+  softSPI_transfer(value);
+  nrf_csn_high();
+}
+
+void write_register_buf(uint8_t reg, const uint8_t *data, uint8_t len) {
+  nrf_csn_low();
+  softSPI_transfer(W_REGISTER | (reg & 0x1F));
+  for (uint8_t i = 0; i < len; i++) {
+    softSPI_transfer(data[i]);
+  }
+  nrf_csn_high();
+}
+
+uint8_t get_status(void) {
+  nrf_csn_low();
+  uint8_t status = softSPI_transfer(NOP);
+  nrf_csn_high();
+  return status;
+}
+
+void flush_tx(void) {
+  nrf_csn_low();
+  softSPI_transfer(FLUSH_TX);
+  nrf_csn_high();
+}
+
+void flush_rx(void) {
+  nrf_csn_low();
+  softSPI_transfer(FLUSH_RX);
+  nrf_csn_high();
+}
+
+uint32_t packServoMap() {
+  uint32_t packed = 0;
+  for (uint8_t i = 0; i < 8; i++) {
+    uint8_t v = (uint8_t)constrain(servo_channel_map[i], 0, 7);
+    packed |= ((uint32_t)v & 0x07UL) << (i * 3);
+  }
+  packed |= ((uint32_t)(plane_type & 0x03)) << 24;
+  packed |= ((uint32_t)(servo_reverse_mask & 0x3FU)) << 26;
+  return packed;
+}
+
+void updateTxServoMap() {
+  txData.servoMapPacked = packServoMap();
+}
+
+bool activateFeaturesIfNeeded() {
+  uint8_t feature = read_register(FEATURE);
+
+  feature |= 0x06;
+  write_register(FEATURE, feature);
+
+  if ((read_register(FEATURE) & 0x06) != 0x06) {
+    nrf_csn_low();
+    softSPI_transfer(ACTIVATE);
+    softSPI_transfer(0x73);
+    nrf_csn_high();
+
+    feature = read_register(FEATURE) | 0x06;
+    write_register(FEATURE, feature);
+  }
+
+  write_register(DYNPD, read_register(DYNPD) | 0x03);
+
+  return ((read_register(FEATURE) & 0x06) == 0x06) &&
+         ((read_register(DYNPD) & 0x03) == 0x03);
+}
+
+uint8_t readDynamicPayloadWidth() {
+  nrf_csn_low();
+  softSPI_transfer(R_RX_PL_WID);
+  uint8_t width = softSPI_transfer(NOP);
+  nrf_csn_high();
+  return width;
+}
+
+bool readAckTelemetry() {
+  if ((read_register(FIFO_STATUS) & 0x01) != 0) {
+    return false;
+  }
+
+  uint8_t width = readDynamicPayloadWidth();
+
+  if (width == 0 || width > 32) {
+    flush_rx();
+    write_register(STATUS, 0x40);
+    return false;
+  }
+
+  if (width != sizeof(TelemetryData)) {
+
+    nrf_csn_low();
+    softSPI_transfer(R_RX_PAYLOAD);
+    for (uint8_t i = 0; i < width; i++) {
+      softSPI_transfer(NOP);
+    }
+    nrf_csn_high();
+
+    write_register(STATUS, 0x40);
+    return false;
+  }
+
+  nrf_csn_low();
+  softSPI_transfer(R_RX_PAYLOAD);
+
+  uint8_t *p = (uint8_t *)&telemetryData;
+  for (uint8_t i = 0; i < sizeof(TelemetryData); i++) {
+    p[i] = softSPI_transfer(NOP);
+  }
+
+  nrf_csn_high();
+
+  write_register(STATUS, 0x40);
+
+  telemetryReceived = true;
+  lastTelemetryReceive = millis();
+  lastValidBatteryPerc = telemetryData.batteryPercent;
+
+  return true;
+}
+
+void radio_init() {
+  write_register(CONFIG, 0x00);
+  write_register(EN_AA, 0x01);
+  write_register(EN_RXADDR, 0x01);
+  write_register(SETUP_AW, 0x03);
+  write_register(SETUP_RETR, 0x12);
+  write_register(RF_CH, 100);
+  write_register(RF_SETUP, 0x06);
+
+  write_register_buf(TX_ADDR, arduino_tx_addr, 5);
+  write_register_buf(RX_ADDR_P0, arduino_tx_addr, 5);
+
+  write_register(RX_PW_P0, 0);
+  ackDynamicEnabled = activateFeaturesIfNeeded();
+
+  write_register(STATUS, 0x70);
+  flush_tx();
+  flush_rx();
+
+  write_register(CONFIG, 0x0E);
+  radioPowerUpMs = millis();
+  radioConfigured = true;
+}
+
+void serviceRadioInit() {
+  unsigned long now = millis();
+
+  if (!radioConfigured) {
+    if ((unsigned long)(now - radioBootMs) >= 100UL) {
+      radio_init();
+    }
+    return;
+  }
+
+  if (!radioReady && (unsigned long)(now - radioPowerUpMs) >= 5UL) {
+    radioReady = true;
+    lastControlSendUs = micros();
+  }
+}
+
+void startDataTx() {
+  if (!radioReady || radioState != RADIO_IDLE) return;
+
+  if ((read_register(FIFO_STATUS) & 0x01) == 0) {
+    readAckTelemetry();
+  } else {
+    write_register(STATUS, 0x40);
+  }
+
+  updateTxServoMap();
+  write_register(STATUS, 0x30);
+
+  nrf_csn_low();
+  softSPI_transfer(W_TX_PAYLOAD);
+  uint8_t* dataPtr = (uint8_t*)&txData;
+  for (uint8_t i = 0; i < sizeof(TransmitterData); i++) {
+    softSPI_transfer(dataPtr[i]);
+  }
+  nrf_csn_high();
+
+  nrf_ce_high();
+  radioTxStartUs = micros();
+  radioState = RADIO_CE_PULSE;
+  radioTxBusy = true;
+}
+
+int8_t serviceDataTx() {
+  unsigned long nowUs = micros();
+
+  if (radioState == RADIO_IDLE) return 0;
+
+  if (radioState == RADIO_CE_PULSE) {
+    if ((unsigned long)(nowUs - radioTxStartUs) >= 15UL) {
+      nrf_ce_low();
+      radioTxStartUs = nowUs;
+      radioState = RADIO_WAIT_TX;
+    }
+    return 0;
+  }
+
+  if (radioState == RADIO_WAIT_TX) {
+    uint8_t status = get_status();
+
+    if (status & 0x20) {
+      lastRetryCount = read_register(OBSERVE_TX) & 0x0F;
+      bool gotTelemetry = false;
+
+      if (ackDynamicEnabled &&
+          ((status & 0x40) || ((read_register(FIFO_STATUS) & 0x01) == 0))) {
+        gotTelemetry = readAckTelemetry();
+      }
+
+      write_register(STATUS, 0x30);
+
+      radioState = RADIO_IDLE;
+      radioTxBusy = false;
+      return gotTelemetry ? 2 : 1;
+    }
+
+    if (status & 0x10) {
+      lastRetryCount = 15;
+      write_register(STATUS, 0x30);
+      flush_tx();
+
+      radioState = RADIO_IDLE;
+      radioTxBusy = false;
+      return -1;
+    }
+
+    if ((unsigned long)(nowUs - radioTxStartUs) > 3500UL) {
+      lastRetryCount = 15;
+      write_register(STATUS, 0x30);
+      flush_tx();
+
+      radioState = RADIO_IDLE;
+      radioTxBusy = false;
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+int mapJoystickToChannel(int value, int center, int deadzone) {
+  int delta = value - center;
+  if (abs(delta) <= deadzone) return 2048;
+
+  if (delta > 0) {
+    long active = (long)value - (center + deadzone);
+    long span = 1023L - (center + deadzone);
+    if (span < 1) span = 1;
+    long mapped = 2048L + CONTROL_START_COUNTS +
+                  (active * (2047L - CONTROL_START_COUNTS)) / span;
+    return (int)constrain(mapped, 2048L, 4095L);
+  } else {
+    long active = (long)(center - deadzone) - value;
+    long span = (long)(center - deadzone);
+    if (span < 1) span = 1;
+    long mapped = 2048L - CONTROL_START_COUNTS -
+                  (active * (2048L - CONTROL_START_COUNTS)) / span;
+    return (int)constrain(mapped, 0L, 2048L);
+  }
+}
+
+int applyDeadzone(int value, int center, int deadzone) {
+  if (abs(value - center) < deadzone) return center;
+  return value;
+}
+
+int readAnalogPinClean(int pin) {
+  int a = analogRead(pin);
+  int b = analogRead(pin);
+  int c = analogRead(pin);
+
+  if (a > b) { int t = a; a = b; b = t; }
+  if (b > c) { int t = b; b = c; c = t; }
+  if (a > b) { int t = a; a = b; b = t; }
+
+  return b;
+}
+
+uint16_t applyExpoRateChannel(uint16_t input) {
+  int32_t d = (int32_t)input - 2048L;
+  if (d == 0) return 2048;
+
+  int32_t a = (d < 0) ? -d : d;
+
+  int32_t cubic = (d * a) / 2048L;
+  cubic = (cubic * a) / 2048L;
+
+  int effectiveExpo = constrain(expo_value, 0, 100);
+  int maxExpoBlend = 100 - MIN_EXPO_LINEAR_PERCENT;
+  int expoBlend = (effectiveExpo * maxExpoBlend) / 100;
+  int linearBlend = 100 - expoBlend;
+
+  int32_t mixed = (d * (int32_t)linearBlend +
+                   cubic * (int32_t)expoBlend) / 100L;
+
+  int effectiveRate = constrain(rate_value, 20, 100);
+  int32_t scaled = (mixed * (int32_t)effectiveRate) / 100L;
+
+  int32_t minScaled = ((int32_t)CONTROL_START_COUNTS * effectiveRate) / 100L;
+  if (minScaled < CONTROL_START_COUNTS) minScaled = CONTROL_START_COUNTS;
+  if (scaled > 0 && scaled < minScaled) scaled = minScaled;
+  if (scaled < 0 && scaled > -minScaled) scaled = -minScaled;
+
+  int32_t out = 2048L + scaled;
+  if (out < 0) out = 0;
+  if (out > 4095) out = 4095;
+  return (uint16_t)out;
+}
+
+void readButtons() {
+  int leftVal = analogRead(LeftPadButtons);
+  int rightVal = analogRead(RightPadButtons);
+
+  buttonLeftUp = false; buttonLeftLeft = false;
+  buttonLeftRight = false; buttonLeftDown = false;
+  buttonRightUp = false; buttonRightLeft = false;
+  buttonRightRight = false; buttonRightDown = false;
+
+  if (leftVal >= 120 && leftVal <= 200) buttonLeftUp = true;
+  else if (leftVal >= 240 && leftVal <= 320) buttonLeftLeft = true;
+  else if (leftVal >= 430 && leftVal <= 520) buttonLeftRight = true;
+  else if (leftVal >= 950) buttonLeftDown = true;
+
+  if (rightVal >= 120 && rightVal <= 200) buttonRightUp = true;
+  else if (rightVal >= 380 && rightVal <= 470) buttonRightLeft = true;
+  else if (rightVal >= 950) buttonRightDown = true;
+}
+
+void handleToggles() {
+  bool toggle1 = (digitalRead(Toggle1) == LOW);
+  bool toggle2 = (digitalRead(Toggle2) == LOW);
+  bool toggle3 = (digitalRead(Toggle3) == LOW);
+  bool toggle4 = (digitalRead(Toggle4) == LOW);
+
+  if (toggle3) {
+    flightMode = MODE_STABILIZE;
+    txData.channels[4] = 2048;
+  } else if (toggle2) {
+    flightMode = MODE_ACRO;
+    txData.channels[4] = 4095;
+  } else {
+    flightMode = MODE_MANUAL;
+    txData.channels[4] = 0;
+  }
+
+  gearDown = toggle4;
+  txData.channels[5] = gearDown ? 4095 : 0;
+
+  lastToggle1 = toggle1;
+  lastToggle2 = toggle2;
+  lastToggle3 = toggle3;
+  lastToggle4 = toggle4;
+
+  txData.toggles[0] = toggle1;
+  txData.toggles[1] = toggle2;
+  txData.toggles[2] = toggle3;
+  txData.toggles[3] = toggle4;
+}
+
+void loadSettings() {
+  EEPROM.get(EEPROM_ADDR, savedSettings);
+  if (savedSettings.magic != EEPROM_MAGIC) {
+    savedSettings.magic = EEPROM_MAGIC;
+    savedSettings.trim_aileron = 0;
+    savedSettings.trim_elevator = 0;
+    savedSettings.trim_rudder = 0;
+    savedSettings.trim_flaps = 0;
+    savedSettings.rate_value = 80;
+    savedSettings.expo_value = 30;
+    savedSettings.plane_type = 0;
+    for(int i=0; i<8; i++) savedSettings.servo_channel_map[i] = 7;
+    savedSettings.reverse_magic = EEPROM_REVERSE_MAGIC;
+    savedSettings.servo_reverse_mask = 0;
+    saveSettings();
+  }
+  trim_aileron = constrain(savedSettings.trim_aileron, -100, 100);
+  trim_elevator = constrain(savedSettings.trim_elevator, -100, 100);
+  trim_rudder = constrain(savedSettings.trim_rudder, -100, 100);
+  trim_flaps = constrain(savedSettings.trim_flaps, -100, 100);
+  rate_value = constrain(savedSettings.rate_value, 20, 100);
+  expo_value = constrain(savedSettings.expo_value, 0, 100);
+
+  plane_type = savedSettings.plane_type;
+  if (plane_type < PLANE_WING || plane_type > PLANE_V_TAIL) {
+    plane_type = PLANE_WING;
+  }
+
+  for (int i = 0; i < 8; i++) {
+    int v = savedSettings.servo_channel_map[i];
+    servo_channel_map[i] = (v >= 0 && v <= 7) ? v : 7;
+  }
+  // Existing installations used the same EEPROM_MAGIC but had no reverse byte.
+  // A separate marker lets us preserve all old settings and safely default reversing to NORMAL.
+  servo_reverse_mask = (savedSettings.reverse_magic == EEPROM_REVERSE_MAGIC)
+      ? (savedSettings.servo_reverse_mask & 0x3FU)
+      : 0U;
+  sanitizePlaneMap();
+}
+
+void saveSettings() {
+  savedSettings.magic = EEPROM_MAGIC;
+  savedSettings.trim_aileron = trim_aileron;
+  savedSettings.trim_elevator = trim_elevator;
+  savedSettings.trim_rudder = trim_rudder;
+  savedSettings.trim_flaps = trim_flaps;
+  savedSettings.rate_value = rate_value;
+  savedSettings.expo_value = expo_value;
+  savedSettings.plane_type = plane_type;
+  for(int i=0; i<8; i++) savedSettings.servo_channel_map[i] = servo_channel_map[i];
+  savedSettings.reverse_magic = EEPROM_REVERSE_MAGIC;
+  savedSettings.servo_reverse_mask = servo_reverse_mask & 0x3FU;
+  EEPROM.put(EEPROM_ADDR, savedSettings);
+}
+
+void resetSettingsToDefaults() {
+  trim_aileron = 0;
+  trim_elevator = 0;
+  trim_rudder = 0;
+  trim_flaps = 0;
+  rate_value = 80;
+  expo_value = 30;
+  plane_type = PLANE_WING;
+  flapPosition = 0;
+  trim_adjust_mode = false;
+  trim_selection = 0;
+  servo_assign_selection = 0;
+  servo_reverse_selection = 0;
+  servo_reverse_mask = 0;
+  for (int i = 0; i < 8; i++) servo_channel_map[i] = 7;
+  sanitizePlaneMap();
+  updatePlaneServoMap();
+  saveSettings();
+}
+
+void handleMenuButtons() {
+
+  if (current_screen == SCREEN_MENU) {
+    if (buttonLeftUp && !menu_up_pressed) {
+      item_selected--;
+      menu_up_pressed = true;
+      if (item_selected < 0) { item_selected = NUM_ITEMS - 1; }
+    } else if (!buttonLeftUp) {
+      menu_up_pressed = false;
+    }
+
+    if (buttonLeftDown && !menu_down_pressed) {
+      item_selected++;
+      menu_down_pressed = true;
+      if (item_selected >= NUM_ITEMS) { item_selected = 0; }
+    } else if (!buttonLeftDown) {
+      menu_down_pressed = false;
+    }
+
+    if (buttonRightUp && !menu_select_pressed) {
+      menu_select_pressed = true;
+      switch(item_selected) {
+        case 0: current_screen = SCREEN_DASHBOARD; break;
+        case 1: current_screen = SCREEN_DUAL_RATES; break;
+        case 2: current_screen = SCREEN_ALL_TRIMS; break;
+        case 3: current_screen = SCREEN_PLANE_TYPE; break;
+        case 4:
+          current_screen = SCREEN_SERVO_MIX;
+          servo_reverse_selection = 0;
+          // Right-Up is also TOGGLE on the mix screen. Keep it latched until released.
+          servo_reverse_toggle_latch = true;
+          servo_reverse_back_latch = buttonRightDown;
+          break;
+        case 5:
+          current_screen = SCREEN_SAVE_SETTINGS;
+          settings_reset_confirm = false;
+          settings_reset_latch = buttonRightLeft;
+          break;
+        default: break;
+      }
+    } else if (!buttonRightUp) {
+      menu_select_pressed = false;
+    }
+
+  } else if (current_screen == SCREEN_SAVE_SETTINGS) {
+    if (settings_reset_confirm) {
+      // Confirmation: Right-Up = YES, Right-Down = NO.
+      if (buttonRightUp && !menu_select_pressed) {
+        menu_select_pressed = true;
+        resetSettingsToDefaults();
+        settings_reset_confirm = false;
+        current_screen = SCREEN_MENU;
+      } else if (!buttonRightUp) {
+        menu_select_pressed = false;
+      }
+
+      if (buttonRightDown && !menu_exit_pressed) {
+        menu_exit_pressed = true;
+        settings_reset_confirm = false;
+      } else if (!buttonRightDown) {
+        menu_exit_pressed = false;
+      }
+
+      if (!buttonRightLeft) settings_reset_latch = false;
+    } else {
+      // Normal settings screen: Right-Up = SAVE, Right-Left = RESET, Right-Down = BACK.
+      if (buttonRightUp && !menu_select_pressed) {
+        menu_select_pressed = true;
+        saveSettings();
+        current_screen = SCREEN_MENU;
+      } else if (!buttonRightUp) {
+        menu_select_pressed = false;
+      }
+
+      if (buttonRightLeft && !settings_reset_latch) {
+        settings_reset_latch = true;
+        settings_reset_confirm = true;
+      } else if (!buttonRightLeft) {
+        settings_reset_latch = false;
+      }
+
+      if (buttonRightDown && !menu_exit_pressed) {
+        menu_exit_pressed = true;
+        current_screen = SCREEN_MENU;
+      } else if (!buttonRightDown) {
+        menu_exit_pressed = false;
+      }
+    }
+
+  } else if (current_screen == SCREEN_PLANE_TYPE) {
+    if (buttonLeftUp && !menu_up_pressed) {
+      plane_type++;
+      if (plane_type > PLANE_V_TAIL) plane_type = PLANE_WING;
+      sanitizePlaneMap();
+      servo_assign_selection = 0;
+      menu_up_pressed = true;
+    } else if (!buttonLeftUp) {
+      menu_up_pressed = false;
+    }
+
+    if (buttonLeftDown && !menu_down_pressed) {
+      plane_type--;
+      if (plane_type < PLANE_WING) plane_type = PLANE_V_TAIL;
+      sanitizePlaneMap();
+      servo_assign_selection = 0;
+      menu_down_pressed = true;
+    } else if (!buttonLeftDown) {
+      menu_down_pressed = false;
+    }
+
+    if (buttonRightUp && !menu_select_pressed) {
+      menu_select_pressed = true;
+      current_screen = SCREEN_SERVO_ASSIGN;
+      servo_assign_selection = 0;
+
+      servo_back_latch = true;
+      servo_output_dec_latch = buttonRightLeft;
+      servo_output_inc_latch = buttonRightDown;
+    } else if (!buttonRightUp) {
+      menu_select_pressed = false;
+    }
+
+    if (buttonRightDown && !menu_exit_pressed) {
+      menu_exit_pressed = true;
+      current_screen = SCREEN_MENU;
+    } else if (!buttonRightDown) {
+      menu_exit_pressed = false;
+    }
+
+  } else if (current_screen == SCREEN_SERVO_ASSIGN) {
+    if (buttonLeftUp && !menu_up_pressed) {
+      servo_assign_selection--;
+      if (servo_assign_selection < 0) servo_assign_selection = planeVisibleCount() - 1;
+      menu_up_pressed = true;
+    } else if (!buttonLeftUp) {
+      menu_up_pressed = false;
+    }
+
+    if (buttonLeftDown && !menu_down_pressed) {
+      servo_assign_selection++;
+      if (servo_assign_selection >= planeVisibleCount()) servo_assign_selection = 0;
+      menu_down_pressed = true;
+    } else if (!buttonLeftDown) {
+      menu_down_pressed = false;
+    }
+
+    if (buttonRightLeft && !servo_output_dec_latch) {
+      uint8_t logicalId = planeLogicalId(servo_assign_selection);
+      servo_channel_map[logicalId] = findNextFreeServoOutput(logicalId, -1);
+      updatePlaneServoMap();
+      servo_output_dec_latch = true;
+    } else if (!buttonRightLeft) {
+      servo_output_dec_latch = false;
+    }
+
+    if (buttonRightDown && !servo_output_inc_latch) {
+      uint8_t logicalId = planeLogicalId(servo_assign_selection);
+      servo_channel_map[logicalId] = findNextFreeServoOutput(logicalId, +1);
+      updatePlaneServoMap();
+      servo_output_inc_latch = true;
+    } else if (!buttonRightDown) {
+      servo_output_inc_latch = false;
+    }
+
+    if (buttonRightUp && !servo_back_latch) {
+      servo_back_latch = true;
+      updatePlaneServoMap();
+      current_screen = SCREEN_PLANE_TYPE;
+    } else if (!buttonRightUp) {
+      servo_back_latch = false;
+    }
+
+  } else if (current_screen == SCREEN_SERVO_MIX) {
+    if (buttonLeftUp && !menu_up_pressed) {
+      servo_reverse_selection--;
+      if (servo_reverse_selection < 0) servo_reverse_selection = 5;
+      menu_up_pressed = true;
+    } else if (!buttonLeftUp) {
+      menu_up_pressed = false;
+    }
+
+    if (buttonLeftDown && !menu_down_pressed) {
+      servo_reverse_selection++;
+      if (servo_reverse_selection > 5) servo_reverse_selection = 0;
+      menu_down_pressed = true;
+    } else if (!buttonLeftDown) {
+      menu_down_pressed = false;
+    }
+
+    // Right-Up toggles only the selected physical servo S1..S6.
+    if (buttonRightUp && !servo_reverse_toggle_latch) {
+      servo_reverse_mask ^= (uint8_t)(1U << servo_reverse_selection);
+      updatePlaneServoMap();
+      servo_reverse_toggle_latch = true;
+    } else if (!buttonRightUp) {
+      servo_reverse_toggle_latch = false;
+    }
+
+    if (buttonRightDown && !servo_reverse_back_latch) {
+      servo_reverse_back_latch = true;
+      current_screen = SCREEN_MENU;
+    } else if (!buttonRightDown) {
+      servo_reverse_back_latch = false;
+    }
+
+  } else if (current_screen == SCREEN_ALL_TRIMS) {
+    if (buttonLeftUp && !trim_lu_latch) {
+      trim_selection--;
+      if (trim_selection < 0) trim_selection = 3;
+      trim_lu_latch = true;
+    } else if (!buttonLeftUp) {
+      trim_lu_latch = false;
+    }
+
+    if (buttonLeftDown && !trim_ld_latch) {
+      trim_selection++;
+      if (trim_selection > 3) trim_selection = 0;
+      trim_ld_latch = true;
+    } else if (!buttonLeftDown) {
+      trim_ld_latch = false;
+    }
+
+    if (buttonRightLeft && !trim_rl_latch) {
+      switch (trim_selection) {
+        case 0: if (trim_aileron > -100) trim_aileron--; break;
+        case 1: if (trim_elevator > -100) trim_elevator--; break;
+        case 2: if (trim_rudder > -100) trim_rudder--; break;
+        case 3: if (trim_flaps > -100) trim_flaps--; break;
+      }
+      trim_rl_latch = true;
+      trim_adjust_mode = true;
+    } else if (!buttonRightLeft) {
+      trim_rl_latch = false;
+    }
+
+    if (buttonLeftRight && !trim_rr_latch) {
+      switch (trim_selection) {
+        case 0: if (trim_aileron < 100) trim_aileron++; break;
+        case 1: if (trim_elevator < 100) trim_elevator++; break;
+        case 2: if (trim_rudder < 100) trim_rudder++; break;
+        case 3: if (trim_flaps < 100) trim_flaps++; break;
+      }
+      trim_rr_latch = true;
+      trim_adjust_mode = true;
+    } else if (!buttonLeftRight) {
+      trim_rr_latch = false;
+    }
+
+    if (buttonRightDown && !trim_exit_latch) {
+      trim_exit_latch = true;
+      trim_adjust_mode = false;
+      current_screen = SCREEN_MENU;
+    } else if (!buttonRightDown) {
+      trim_exit_latch = false;
+    }
+
+  } else if (current_screen == SCREEN_DUAL_RATES) {
+
+    if (buttonLeftUp && !menu_up_pressed) {
+      rate_value += 5;
+      if (rate_value > 100) rate_value = 100;
+      menu_up_pressed = true;
+    } else if (!buttonLeftUp) {
+      menu_up_pressed = false;
+    }
+
+    if (buttonLeftDown && !menu_down_pressed) {
+      rate_value -= 5;
+      if (rate_value < 0) rate_value = 0;
+      menu_down_pressed = true;
+    } else if (!buttonLeftDown) {
+      menu_down_pressed = false;
+    }
+
+    if (buttonLeftLeft && !menu_select_pressed) {
+      expo_value -= 5;
+      if (expo_value < 0) expo_value = 0;
+      menu_select_pressed = true;
+    } else if (!buttonLeftLeft) {
+      menu_select_pressed = false;
+    }
+
+    if (buttonLeftRight && !menu_exit_pressed) {
+      expo_value += 5;
+      if (expo_value > 100) expo_value = 100;
+      menu_exit_pressed = true;
+    } else if (!buttonLeftRight) {
+      menu_exit_pressed = false;
+    }
+
+    if (buttonRightDown && !menu_down_pressed) {
+      menu_down_pressed = true;
+      current_screen = SCREEN_MENU;
+    } else if (!buttonRightDown) {
+      menu_down_pressed = false;
+    }
+
+  } else if (current_screen == SCREEN_DASHBOARD) {
+    if (buttonLeftUp && !menu_up_pressed) {
+      flapPosition--;
+      if (flapPosition < 0) flapPosition = 0;
+      menu_up_pressed = true;
+    } else if (!buttonLeftUp) {
+      menu_up_pressed = false;
+    }
+
+    if (buttonLeftDown && !menu_down_pressed) {
+      flapPosition++;
+      if (flapPosition > 2) flapPosition = 2;
+      menu_down_pressed = true;
+    } else if (!buttonLeftDown) {
+      menu_down_pressed = false;
+    }
+
+    txData.channels[7] = map(flapPosition, 0, 2, 0, 4095);
+
+    if (buttonRightDown && !menu_exit_pressed) {
+      menu_exit_pressed = true;
+      current_screen = SCREEN_MENU;
+    } else if (!buttonRightDown) {
+      menu_exit_pressed = false;
+    }
+  } else {
+    if (buttonRightDown && !menu_exit_pressed) {
+      menu_exit_pressed = true;
+      current_screen = SCREEN_MENU;
+    } else if (!buttonRightDown) {
+      menu_exit_pressed = false;
+    }
+  }
+}
+
+void updatePlaneServoMap() {
+  updateTxServoMap();
+}
+
+void loadPlaneServoMap() {
+  updateTxServoMap();
+}
+
+uint8_t uiAnimPhase(uint16_t speedMs = 120U) {
+  if (speedMs < 40U) speedMs = 40U;
+  return (uint8_t)((millis() / speedMs) & 0x0FU);
+}
+
+
+// Legacy full-screen UI assets removed: the PRO MONO theme uses lightweight primitives.
+
+bool fcImuCalibrating() {
+  if (!telemetryReceived) return false;
+
+  if ((telemetryData.state & 0x08U) != 0U) return true;
+
+  if ((telemetryData.state & 0x02U) == 0U && telemetryData.calibrationProgress < 100U) {
+    return true;
+  }
+
+  return false;
+}
+
+void drawSignalGlyph(int x, int y, uint8_t quality) {
+  uint8_t bars = 0;
+  if (quality >= 85) bars = 4;
+  else if (quality >= 60) bars = 3;
+  else if (quality >= 35) bars = 2;
+  else if (quality >= 10) bars = 1;
+  for (uint8_t i = 0; i < 4; i++) {
+    int h = 2 + i * 2;
+    int bx = x + i * 4;
+    int by = y + 8 - h;
+    if (i < bars) u8g.drawRBox(bx, by, 3, h, 1);
+    else u8g.drawRFrame(bx, by, 3, h, 1);
+  }
+}
+
+
+
+// ============================================================
+// XP RASTER FLIGHT V19 - production bitmap OLED UI
+// 128x64 monochrome. Black-space-first mobile UI: animated carousel motion,
+// smooth bitmap scroll thumbs, sliding selected rows, narrow throttle gauge,
+// moving aircraft/status cues and no frozen panel cages. PROGMEM artwork only.
+// Radio/control/EEPROM/telemetry behavior is untouched.
+// ============================================================
+
+static const uint8_t bmp_menu_dash_16x12[] PROGMEM = {
+  0x00,0xC0,0x40,0x80,0x01,0x20,0x01,0x00,0x00,0x00,0x03,0xB8,0x0F,0xBC,0x79,0xA4,
+  0x21,0xA0,0x01,0xA0,0x01,0xB0,0x04,0x08
+};
+static const uint8_t bmp_menu_rates_16x12[] PROGMEM = {
+  0x00,0x00,0x07,0xE0,0x1C,0x38,0x10,0x18,0x24,0x34,0x01,0xC0,0x01,0x80,0x01,0x80,
+  0x10,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+};
+static const uint8_t bmp_menu_trim_16x12[] PROGMEM = {
+  0x00,0x00,0x0C,0x00,0x0C,0x00,0x0C,0x00,0x0C,0x00,0x00,0x30,0x7F,0xFE,0x00,0x30,
+  0x01,0x80,0x7F,0xFE,0x01,0x80,0x00,0x00
+};
+static const uint8_t bmp_menu_plane_16x12[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x01,0x80,0x00,0x00,0x06,0x60,0x19,0x98,0x22,0x44,0x7C,0xBE,
+  0x31,0x84,0x00,0x00,0x00,0x00,0x00,0x00
+};
+static const uint8_t bmp_menu_reverse_16x12[] PROGMEM = {
+  0x03,0x80,0x27,0xE0,0x30,0x70,0x18,0x18,0x20,0x18,0x60,0x08,0x60,0x08,0x20,0x18,
+  0x30,0x18,0x18,0x70,0x0F,0xE0,0x00,0x00
+};
+static const uint8_t bmp_menu_save_16x12[] PROGMEM = {
+  0x1F,0xF0,0x38,0x18,0x38,0x18,0x38,0x3C,0x3F,0xFC,0x20,0x04,0x20,0x04,0x20,0x04,
+  0x20,0x04,0x20,0x04,0x20,0x0C,0x1F,0xF8
+};
+static const uint8_t bmp_plane_norm_48x27[] PROGMEM = {
+  0x00,0x00,0x01,0x80,0x00,0x00,0x00,0x00,0x03,0xC0,0x00,0x00,0x00,0x00,0x02,0x40,
+  0x00,0x00,0x00,0x00,0x06,0x60,0x00,0x00,0x00,0x00,0x04,0xA0,0x00,0x00,0x00,0x00,
+  0x0A,0x20,0x00,0x00,0x00,0x00,0x08,0x50,0x00,0x00,0x00,0x00,0x0D,0x30,0x00,0x00,
+  0x00,0x00,0x0C,0x30,0x00,0x00,0x00,0x00,0x3C,0x7C,0x00,0x00,0x00,0x00,0xFF,0xFF,
+  0x00,0x00,0x00,0x07,0xBE,0x7D,0xC0,0x00,0x00,0x1A,0xFE,0x7F,0x78,0x00,0x00,0xE7,
+  0xF6,0x7F,0xE6,0x00,0x03,0x67,0xFE,0xEF,0xE7,0xC0,0x1D,0xF7,0xFE,0x7F,0xEF,0x70,
+  0x6F,0xE7,0xF6,0x7F,0x67,0xEE,0xFF,0xE6,0xDE,0x6D,0xE7,0xFF,0xD2,0x00,0x6E,0xED,
+  0x00,0x37,0x00,0x00,0x06,0x60,0x00,0x00,0x00,0x00,0x06,0x60,0x00,0x00,0x00,0x00,
+  0x06,0x50,0x00,0x00,0x00,0x00,0x3A,0x58,0x00,0x00,0x00,0x00,0xF2,0xCF,0x00,0x00,
+  0x00,0x03,0xFA,0x5F,0xC0,0x00,0x00,0x0F,0xDA,0xDF,0x70,0x00,0x00,0x0E,0xB3,0x95,
+  0xF0,0x00
+};
+static const uint8_t bmp_plane_wing_48x27[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x80,
+  0x00,0x00,0x00,0x00,0x03,0xC0,0x00,0x00,0x00,0x00,0x02,0x40,0x00,0x00,0x00,0x00,
+  0x06,0x60,0x00,0x00,0x00,0x00,0x04,0x20,0x00,0x00,0x00,0x00,0x0C,0x10,0x00,0x00,
+  0x00,0x00,0x1C,0x38,0x00,0x00,0x00,0x00,0x7E,0x36,0x00,0x00,0x00,0x00,0xCE,0x73,
+  0x80,0x00,0x00,0x03,0x86,0x60,0xC0,0x00,0x00,0x0E,0x06,0x60,0x70,0x00,0x00,0x3C,
+  0x06,0x60,0x3C,0x00,0x00,0xF0,0x0E,0x70,0x0F,0x00,0x01,0xE0,0x1E,0x78,0x07,0xC0,
+  0x07,0x80,0x3E,0x7E,0x01,0xE0,0x1F,0x07,0x72,0x4F,0x70,0xF8,0x3F,0xFF,0xC2,0x43,
+  0xFF,0xFC,0x0F,0xFF,0x82,0x61,0xFF,0xF0,0x07,0xF8,0x06,0x60,0x1F,0xE0,0x00,0x00,
+  0x06,0x60,0x00,0x00,0x00,0x00,0x06,0x60,0x00,0x00,0x00,0x00,0x0E,0x70,0x00,0x00,
+  0x00,0x00,0x04,0x20,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00
+};
+static const uint8_t bmp_plane_vtail_48x27[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x80,
+  0x00,0x00,0x00,0x00,0x01,0x80,0x00,0x00,0x00,0x00,0x02,0x40,0x00,0x00,0x00,0x00,
+  0x02,0x40,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x04,0x00,0x00,0x00,
+  0x00,0x00,0x0C,0x30,0x00,0x00,0x00,0x00,0x1E,0x38,0x00,0x00,0x00,0x00,0x6E,0x76,
+  0x00,0x00,0x00,0x01,0xC6,0x73,0x80,0x00,0x00,0x07,0x06,0x60,0xE0,0x00,0x00,0x1E,
+  0x0E,0x70,0x78,0x00,0x00,0x78,0x1E,0x78,0x1E,0x00,0x01,0xE0,0x3E,0x7C,0x07,0x80,
+  0x07,0xC7,0xFE,0x7F,0xE3,0xE0,0x0F,0xFF,0xCE,0x7B,0xFF,0xF0,0x03,0xFF,0xCE,0x71,
+  0xFF,0xC0,0x01,0xFC,0x0E,0x70,0x3F,0x80,0x00,0x00,0x0E,0x70,0x00,0x00,0x00,0x00,
+  0x1E,0x78,0x00,0x00,0x00,0x00,0x3E,0x7C,0x00,0x00,0x00,0x00,0xFE,0x7F,0x00,0x00,
+  0x00,0x01,0xF8,0x0F,0x80,0x00,0x00,0x03,0xE0,0x07,0xC0,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00
+};
+
+// Dashboard attitude animation sprites: real raster bitmaps, not runtime line art.
+// Two banked frames per aircraft type. Neutral reuses the existing detailed level bitmap.
+static const uint8_t bmp_dash_plane_norm_left_48x27[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x60,0x00,0x00,0x00,0x00,0x00,0x60,0x00,0x00,
+  0x00,0x00,0x00,0x60,0x00,0x00,0x00,0x00,0x01,0xE0,0x00,0x00,
+  0x00,0x00,0x01,0x20,0x00,0x00,0x00,0x00,0x01,0x20,0x00,0x00,
+  0x00,0x00,0x02,0x00,0x00,0x00,0x00,0x00,0x02,0x10,0x00,0x00,
+  0x00,0x00,0x3C,0x10,0x00,0x00,0x00,0x1F,0x77,0xC0,0x00,0x00,
+  0x01,0xFD,0x3B,0x9C,0x00,0x00,0x00,0xF2,0xFD,0xEE,0x00,0x00,
+  0x00,0x7D,0x86,0xBC,0x80,0x00,0x00,0x00,0x05,0xFF,0xF8,0x00,
+  0x00,0x00,0x0F,0xE1,0x3C,0x00,0x00,0x00,0x0F,0xC0,0x9C,0x00,
+  0x00,0x00,0x0E,0xC0,0x7F,0x00,0x00,0x00,0x0F,0xC0,0x06,0x00,
+  0x00,0x02,0xFB,0x40,0x00,0x00,0x00,0x01,0xEF,0xC0,0x00,0x00,
+  0x00,0x00,0x06,0x3C,0x00,0x00,0x00,0x00,0x00,0x3E,0x00,0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00
+};
+
+static const uint8_t bmp_dash_plane_norm_right_48x27[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x06,0x00,0x00,0x00,0x00,0x00,0x06,0x00,0x00,0x00,
+  0x00,0x00,0x06,0x00,0x00,0x00,0x00,0x00,0x07,0x80,0x00,0x00,
+  0x00,0x00,0x04,0x80,0x00,0x00,0x00,0x00,0x04,0x80,0x00,0x00,
+  0x00,0x00,0x00,0x40,0x00,0x00,0x00,0x00,0x08,0x40,0x00,0x00,
+  0x00,0x00,0x08,0x3C,0x00,0x00,0x00,0x00,0x07,0xCE,0xF8,0x00,
+  0x00,0x00,0x3B,0x9C,0xBF,0x80,0x00,0x00,0x75,0xFF,0x4F,0x00,
+  0x00,0x01,0x3E,0xA1,0xBE,0x00,0x00,0x1F,0xFD,0xE0,0x00,0x00,
+  0x00,0x3C,0x87,0xF0,0x00,0x00,0x00,0x39,0x03,0xF0,0x00,0x00,
+  0x00,0xFE,0x03,0xB0,0x00,0x00,0x00,0x60,0x03,0xF0,0x00,0x00,
+  0x00,0x00,0x02,0xDF,0x40,0x00,0x00,0x00,0x03,0xF7,0x80,0x00,
+  0x00,0x00,0x3C,0x60,0x00,0x00,0x00,0x00,0x7C,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00
+};
+
+static const uint8_t bmp_dash_plane_wing_left_48x27[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x40,0x00,0x00,0x00,0x00,0x00,0xA0,0x00,0x00,
+  0x00,0x00,0x00,0xA0,0x00,0x00,0x00,0x00,0x02,0x20,0x00,0x00,
+  0x00,0x00,0x06,0x20,0x00,0x00,0x00,0x00,0x1C,0x00,0x00,0x00,
+  0x00,0x00,0x3C,0x10,0x00,0x00,0x00,0x03,0xFC,0x1C,0x00,0x00,
+  0x00,0x0F,0xC0,0x16,0x00,0x00,0x00,0xFC,0x38,0x1F,0x00,0x00,
+  0x03,0xF2,0xFE,0x65,0x80,0x00,0x17,0x07,0xCA,0xF9,0xC0,0x00,
+  0x0E,0xFD,0x3C,0xBE,0x60,0x00,0x0D,0xFE,0xF2,0xE7,0x78,0x00,
+  0x02,0x60,0x1D,0xF9,0x9C,0x00,0x00,0x00,0x1D,0xDC,0xCE,0x00,
+  0x00,0x00,0x0C,0xC3,0x73,0x00,0x00,0x00,0x0D,0x80,0xF1,0x80,
+  0x00,0x00,0x05,0x80,0x3D,0xE0,0x00,0x00,0x05,0x00,0x03,0x80,
+  0x00,0x00,0x0A,0x00,0x02,0x00,0x00,0x00,0x04,0x00,0x00,0x00,
+  0x00,0x00,0x04,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00
+};
+
+static const uint8_t bmp_dash_plane_wing_right_48x27[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x04,0x00,0x00,0x00,0x00,0x00,0x0A,0x00,0x00,0x00,
+  0x00,0x00,0x0A,0x00,0x00,0x00,0x00,0x00,0x08,0x80,0x00,0x00,
+  0x00,0x00,0x08,0x80,0x00,0x00,0x00,0x00,0x08,0x70,0x00,0x00,
+  0x00,0x00,0x10,0x58,0x00,0x00,0x00,0x00,0x70,0x5E,0x80,0x00,
+  0x00,0x00,0xF0,0x05,0xE0,0x00,0x00,0x01,0xF0,0x19,0x7A,0x00,
+  0x00,0x01,0xC6,0x7E,0x1F,0x80,0x00,0x07,0x3A,0xE7,0xE4,0xC0,
+  0x00,0x0E,0xFC,0xB9,0xB8,0xF0,0x00,0x3C,0xCA,0xFE,0x7D,0xE0,
+  0x00,0x33,0x3F,0x70,0x8E,0x80,0x00,0xC3,0x7F,0x70,0x00,0x00,
+  0x01,0xDE,0x87,0x20,0x00,0x00,0x03,0xBF,0x07,0x60,0x00,0x00,
+  0x0F,0x78,0x03,0x60,0x00,0x00,0x0B,0x40,0x01,0x40,0x00,0x00,
+  0x00,0x80,0x00,0xA0,0x00,0x00,0x00,0x00,0x00,0x40,0x00,0x00,
+  0x00,0x00,0x00,0x40,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00
+};
+
+static const uint8_t bmp_dash_plane_vtail_left_48x27[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x60,0x00,0x00,0x00,0x00,0x00,0x60,0x00,0x00,
+  0x00,0x00,0x00,0x60,0x00,0x00,0x00,0x00,0x01,0xE0,0x00,0x00,
+  0x00,0x00,0x01,0x20,0x00,0x00,0x00,0x00,0x01,0x20,0x00,0x00,
+  0x00,0x00,0x02,0x00,0x00,0x00,0x00,0x00,0x02,0x10,0x00,0x00,
+  0x00,0x00,0x3C,0x10,0x00,0x00,0x00,0x07,0xF7,0xC0,0x00,0x00,
+  0x00,0x5F,0xCB,0x9C,0x00,0x00,0x03,0xF8,0x3F,0x6F,0x00,0x00,
+  0x01,0xF7,0xFD,0xF3,0x80,0x00,0x01,0x71,0x86,0xBC,0xE0,0x00,
+  0x00,0x00,0x0B,0xFF,0x78,0x00,0x00,0x00,0x0F,0xC3,0x3C,0x00,
+  0x00,0x00,0x0F,0xC0,0xDC,0x00,0x00,0x00,0x0B,0x40,0x3F,0x80,
+  0x00,0x00,0x1F,0xC0,0x03,0x00,0x00,0x00,0xFF,0xC0,0x02,0x00,
+  0x00,0x07,0x69,0xC0,0x00,0x00,0x00,0x03,0x80,0x70,0x00,0x00,
+  0x00,0x00,0x00,0x28,0x00,0x00,0x00,0x00,0x00,0x1E,0x00,0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00
+};
+
+static const uint8_t bmp_dash_plane_vtail_right_48x27[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x06,0x00,0x00,0x00,0x00,0x00,0x06,0x00,0x00,0x00,
+  0x00,0x00,0x06,0x00,0x00,0x00,0x00,0x00,0x07,0x80,0x00,0x00,
+  0x00,0x00,0x04,0x80,0x00,0x00,0x00,0x00,0x04,0x80,0x00,0x00,
+  0x00,0x00,0x00,0x40,0x00,0x00,0x00,0x00,0x08,0x40,0x00,0x00,
+  0x00,0x00,0x08,0x3C,0x00,0x00,0x00,0x00,0x07,0xCF,0xE0,0x00,
+  0x00,0x00,0x3B,0x93,0xFA,0x00,0x00,0x00,0xF7,0x7C,0x1F,0xC0,
+  0x00,0x01,0xCD,0xFF,0xEF,0x80,0x00,0x07,0x3E,0xA1,0x8E,0x80,
+  0x00,0x1E,0xFC,0xF0,0x00,0x00,0x00,0x3C,0xC3,0xF0,0x00,0x00,
+  0x00,0x3B,0x03,0xF0,0x00,0x00,0x01,0xFC,0x02,0xD0,0x00,0x00,
+  0x00,0xC0,0x03,0xF8,0x00,0x00,0x00,0x40,0x03,0xFF,0x00,0x00,
+  0x00,0x00,0x03,0x96,0xE0,0x00,0x00,0x00,0x0E,0x01,0xC0,0x00,
+  0x00,0x00,0x14,0x00,0x00,0x00,0x00,0x00,0x78,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00
+};
+
+static const uint8_t bmp_status_battery_16x8[] PROGMEM = {
+  0x7F,0xF8,0x40,0x08,0x5F,0x8C,0x5F,0x8C,0x5F,0x8C,0x5F,0x8C,0x40,0x08,0x7F,0xF8
+};
+static const uint8_t bmp_status_bolt_8x8[] PROGMEM = {
+  0x00,0x18,0x18,0x3E,0x0C,0x08,0x18,0x10
+};
+static const uint8_t bmp_status_lock_8x8[] PROGMEM = {
+  0x18,0x24,0x24,0x7E,0x7E,0x7E,0x7E,0x00
+};
+static const uint8_t bmp_status_gear_8x8[] PROGMEM = {
+  0x18,0x18,0x3C,0x66,0x5A,0x7E,0x3C,0x00
+};
+static const uint8_t bmp_rf_tower_16x16[] PROGMEM = {
+  0x63,0xE6,0x4C,0x33,0x18,0x18,0x00,0x08,0x01,0x80,0x01,0x80,0x01,0x80,0x03,0x40,
+  0x03,0xC0,0x03,0xE0,0x06,0x20,0x07,0xE0,0x0F,0xF0,0x08,0x10,0x0F,0xF8,0x0F,0xF0
+};
+
+static const uint8_t bmp_ui_scroll_rail_8x48[] PROGMEM = {
+  0x18,0x24,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,
+  0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,
+  0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x24,0x18
+};
+
+static const uint8_t bmp_ui_scroll_thumb_8x10[] PROGMEM = {
+  0x18,0x3C,0x7E,0x7E,0x7E,0x7E,0x7E,0x7E,0x3C,0x18
+};
+
+static const uint8_t bmp_ui_focus_8x13[] PROGMEM = {
+  0x18,0x3C,0x7E,0x7E,0x7E,0x7E,0x7E,0x7E,0x7E,0x7E,0x7E,0x3C,0x18
+};
+
+static const uint8_t bmp_ui_track_56x7[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x20,0x02,0x00,0x08,0x00,0x20,0x04,0x20,0x02,
+  0x00,0x08,0x00,0x20,0x04,0x24,0x92,0x49,0x2C,0x92,0x69,0x24,0x20,0x02,0x00,0x08,
+  0x00,0x20,0x04,0x20,0x02,0x00,0x08,0x00,0x20,0x04,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00
+};
+
+static const uint8_t bmp_ui_track_40x7[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x20,0x20,0x08,0x02,0x04,0x20,0x20,0x08,0x02,0x04,0x24,
+  0xB2,0x49,0x26,0x94,0x20,0x20,0x08,0x02,0x04,0x20,0x20,0x08,0x02,0x04,0x00,0x00,
+  0x00,0x00,0x00
+};
+
+static const uint8_t bmp_ui_xpmark_24x8[] PROGMEM = {
+  0x00,0x8B,0xC0,0xFE,0x52,0x7F,0x00,0x52,0x40,0xFC,0x23,0xFF,0x00,0x22,0x00,0xF8,
+  0x52,0x1F,0x00,0x52,0x00,0x00,0x8A,0x00
+};
+
+static const uint8_t bmp_ui_cursor_8x5[] PROGMEM = {
+  0x18,0x3C,0x7E,0x3C,0x18
+};
+
+static const uint8_t bmp_ui_dot_8x3[] PROGMEM = {
+  0x18,0x3C,0x18
+};
+
+static const uint8_t bmp_ui_graph_48x38[] PROGMEM = {
+  0x3F,0xFF,0xFF,0xFF,0xFF,0xFC,0x40,0x00,0x00,0x00,0x00,0x02,0x80,0x00,0x00,0x00,
+  0x00,0x01,0x80,0x08,0x00,0x80,0x08,0x01,0x80,0x00,0x00,0x00,0x00,0x01,0x80,0x00,
+  0x00,0x00,0x00,0x01,0x80,0x08,0x00,0x80,0x08,0x01,0x80,0x00,0x00,0x00,0x00,0x01,
+  0x80,0x00,0x00,0x00,0x00,0x01,0x92,0x49,0x24,0x92,0x49,0x21,0x80,0x00,0x00,0x00,
+  0x00,0x01,0x80,0x00,0x00,0x00,0x00,0x01,0x80,0x08,0x00,0x80,0x08,0x01,0x80,0x00,
+  0x00,0x00,0x00,0x01,0x80,0x00,0x00,0x00,0x00,0x01,0x80,0x08,0x00,0x80,0x08,0x01,
+  0x80,0x00,0x00,0x00,0x00,0x01,0x80,0x00,0x00,0x00,0x00,0x01,0x80,0x08,0x00,0x80,
+  0x08,0x01,0x92,0x49,0x24,0x92,0x49,0x21,0x80,0x00,0x00,0x00,0x00,0x01,0x80,0x08,
+  0x00,0x80,0x08,0x01,0x80,0x00,0x00,0x00,0x00,0x01,0x80,0x00,0x00,0x00,0x00,0x01,
+  0x80,0x08,0x00,0x80,0x08,0x01,0x80,0x00,0x00,0x00,0x00,0x01,0x80,0x00,0x00,0x00,
+  0x00,0x01,0x80,0x08,0x00,0x80,0x08,0x01,0x92,0x49,0x24,0x92,0x49,0x21,0x80,0x00,
+  0x00,0x00,0x00,0x01,0x80,0x08,0x00,0x80,0x08,0x01,0x80,0x00,0x00,0x00,0x00,0x01,
+  0x80,0x00,0x00,0x00,0x00,0x01,0x80,0x08,0x00,0x80,0x08,0x01,0x80,0x00,0x00,0x00,
+  0x00,0x01,0x80,0x00,0x00,0x00,0x00,0x01,0x40,0x00,0x00,0x00,0x00,0x02,0x3F,0xFF,
+  0xFF,0xFF,0xFF,0xFC
+};
+
+static const uint8_t bmp_ui_signal0_16x8[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+};
+
+static const uint8_t bmp_ui_signal1_16x8[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x98,0x00,0xD8,0x00
+};
+
+static const uint8_t bmp_ui_signal2_16x8[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x06,0x00,0x9A,0x00,0xDA,0x00
+};
+
+static const uint8_t bmp_ui_signal3_16x8[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x10,0x00,0xD0,0x00,0xD0,0x06,0xD0,0x9A,0xD0,0xDA,0xD0
+};
+
+static const uint8_t bmp_ui_signal4_16x8[] PROGMEM = {
+  0x00,0x03,0x00,0x03,0x00,0x1B,0x00,0xDB,0x00,0xDB,0x06,0xDB,0x9A,0xDB,0xDA,0xDB
+};
+
+
+// Production dashboard throttle gauge. The frame and segments are bitmaps so
+// the live gauge keeps the same crisp visual language as the rest of the UI.
+static const uint8_t bmp_dash_thr_frame_16x40[] PROGMEM = {
+  0x3F,0xF0, 0x40,0x08, 0x80,0x04, 0x80,0x04,
+  0x80,0x04, 0x80,0x04, 0x80,0x04, 0x80,0x04,
+  0x80,0x04, 0x80,0x04, 0x80,0x04, 0x80,0x04,
+  0x80,0x04, 0x80,0x04, 0x80,0x04, 0x80,0x04,
+  0x80,0x04, 0x80,0x04, 0x80,0x04, 0x80,0x04,
+  0x80,0x04, 0x80,0x04, 0x80,0x04, 0x80,0x04,
+  0x80,0x04, 0x80,0x04, 0x80,0x04, 0x80,0x04,
+  0x80,0x04, 0x80,0x04, 0x80,0x04, 0x80,0x04,
+  0x80,0x04, 0x80,0x04, 0x80,0x04, 0x40,0x08,
+  0x3F,0xF0, 0x00,0x00, 0x00,0x00, 0x00,0x00
+};
+
+static const uint8_t bmp_dash_thr_segment_8x3[] PROGMEM = {
+  0x7E, 0x7E, 0x7E
+};
+
+// V19 8-pixel production throttle bitmap: rounded capsule + raster ticks.
+static const uint8_t bmp_dash_thr_narrow_8x40[] PROGMEM = {
+  0x18,0x24,0x42,0x42,0x42,0x42,0x42,0x42,0x62,0x42,0x42,0x42,0x42,0x42,0x42,0x42,
+  0x62,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x62,0x42,0x42,0x42,0x42,0x42,0x42,0x42,
+  0x62,0x42,0x42,0x42,0x42,0x42,0x24,0x18
+};
+static const uint8_t bmp_dash_thr_narrow_seg_8x2[] PROGMEM = {
+  0x3C,0x3C
+};
+
+// Small kinetic accents. They are intentionally tiny so animation costs almost no flash.
+static const uint8_t bmp_motion_pulse_8x5[] PROGMEM = { 0x18,0x3C,0x7E,0x3C,0x18 };
+
+struct SmoothScrollState { int16_t fromY; int16_t toY; uint32_t started; bool init; };
+struct SlideState { int8_t last; int8_t dir; uint32_t started; bool init; };
+struct CarouselState { uint8_t shown; uint8_t from; int8_t dir; uint32_t started; bool init; };
+
+static SmoothScrollState trimScrollState={0,0,0,false};
+static SmoothScrollState mapScrollState={0,0,0,false};
+static SmoothScrollState reverseScrollState={0,0,0,false};
+static SlideState trimSlideState={0,0,0,false};
+static SlideState mapSlideState={0,0,0,false};
+static SlideState reverseSlideState={0,0,0,false};
+static SlideState planeSlideState={0,0,0,false};
+static CarouselState menuCarouselState={0,0,-1,0,false};
+
+// V17 production bitmap components.
+static const uint8_t bmp_menu_dash_24x18[] PROGMEM = {
+  0x00,0x0E,0x00,0x00,0x0E,0x00,0x20,0x08,0x00,0x00,0x11,0x00,0x00,0x19,0x00,0x00,
+  0x10,0x80,0x00,0x00,0x80,0x00,0x30,0xC0,0x00,0x79,0xE0,0x03,0xF9,0xF8,0x0F,0xF0,
+  0xF8,0x3F,0x19,0x98,0x10,0x19,0x80,0x00,0x19,0x80,0x00,0x19,0x80,0x00,0x39,0xC0,
+  0x00,0xF9,0xF0,0x00,0x80,0x20
+};
+
+static const uint8_t bmp_menu_rates_24x18[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x7E,0x00,0x01,0xFF,0x80,0x07,0x81,0xE0,0x0E,0x00,0x70,0x0C,
+  0x00,0xF0,0x18,0x81,0xD8,0x18,0x07,0x98,0x00,0x1E,0x00,0x00,0x3C,0x00,0x00,0x3C,
+  0x00,0x00,0x18,0x00,0x04,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00
+};
+
+static const uint8_t bmp_menu_trim_24x18[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x00,0x03,0x80,0x00,0x03,0x80,0x00,0x3F,0xFF,0xFC,0x03,
+  0x80,0x00,0x03,0x80,0x00,0x00,0x01,0xC0,0x00,0x01,0xC0,0x3F,0xFF,0xFC,0x00,0x01,
+  0xC0,0x00,0x01,0xC0,0x00,0x38,0x00,0x00,0x38,0x00,0x3F,0xFF,0xFC,0x00,0x38,0x00,
+  0x00,0x38,0x00,0x00,0x00,0x00
+};
+
+static const uint8_t bmp_menu_plane_24x18[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x18,0x00,0x00,0x24,0x00,0x00,
+  0x24,0x00,0x00,0xE7,0x00,0x03,0xBC,0xC0,0x0E,0x3C,0x70,0x18,0x66,0x18,0x73,0xE7,
+  0xCE,0x7F,0x8D,0xFE,0x14,0x3C,0x08,0x00,0x3C,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00
+};
+
+static const uint8_t bmp_menu_reverse_24x18[] PROGMEM = {
+  0x00,0x7C,0x00,0x00,0xFE,0x00,0x19,0xFF,0x80,0x1D,0x03,0xC0,0x0E,0x00,0xE0,0x0E,
+  0x00,0x60,0x10,0x00,0x70,0x38,0x00,0x30,0x38,0x00,0x30,0x38,0x00,0x30,0x38,0x00,
+  0x30,0x18,0x00,0x70,0x1C,0x00,0x60,0x0E,0x00,0xE0,0x0F,0x03,0xC0,0x03,0xFF,0x80,
+  0x00,0xFC,0x00,0x00,0x00,0x00
+};
+
+static const uint8_t bmp_menu_save_24x18[] PROGMEM = {
+  0x07,0xFF,0xC0,0x1F,0x00,0xE0,0x1F,0x04,0xF0,0x1F,0x04,0xF0,0x1F,0x00,0xF8,0x1F,
+  0x01,0xF8,0x1F,0xFF,0xF8,0x1F,0xFF,0xF8,0x18,0x00,0x18,0x18,0x00,0x18,0x18,0x00,
+  0x18,0x18,0x00,0x18,0x18,0x00,0x18,0x18,0x00,0x18,0x18,0x00,0x18,0x18,0x00,0x38,
+  0x1F,0xFF,0xF8,0x0F,0xFF,0xF0
+};
+
+static const uint8_t bmp_panel_tl_8x8[] PROGMEM = {
+  0x1F,0x20,0x40,0x80,0x80,0x80,0x80,0x80
+};
+
+static const uint8_t bmp_panel_tr_8x8[] PROGMEM = {
+  0xF8,0x04,0x02,0x01,0x01,0x01,0x01,0x01
+};
+
+static const uint8_t bmp_panel_bl_8x8[] PROGMEM = {
+  0x80,0x80,0x80,0x80,0x80,0x40,0x20,0x1F
+};
+
+static const uint8_t bmp_panel_br_8x8[] PROGMEM = {
+  0x01,0x01,0x01,0x01,0x01,0x02,0x04,0xF8
+};
+
+static const uint8_t bmp_panel_top_8x8[] PROGMEM = {
+  0xFF,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+};
+
+static const uint8_t bmp_panel_bottom_8x8[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF
+};
+
+static const uint8_t bmp_panel_left_8x8[] PROGMEM = {
+  0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80
+};
+
+static const uint8_t bmp_panel_right_8x8[] PROGMEM = {
+  0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01
+};
+
+static const uint8_t bmp_row_l_8x13[] PROGMEM = {
+  0x1F,0x20,0x40,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x40,0x20,0x1F
+};
+
+static const uint8_t bmp_row_m_8x13[] PROGMEM = {
+  0xFF,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF
+};
+
+static const uint8_t bmp_row_r_8x13[] PROGMEM = {
+  0xF8,0x04,0x02,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x02,0x04,0xF8
+};
+
+static const uint8_t bmp_dot_empty_8x5[] PROGMEM = {
+  0x00,0x18,0x24,0x24,0x18
+};
+
+static const uint8_t bmp_dot_full_8x5[] PROGMEM = {
+  0x00,0x18,0x3C,0x3C,0x18
+};
+
+static const uint8_t bmp_arrow_left_8x9[] PROGMEM = {
+  0x00,0x02,0x04,0x18,0x20,0x10,0x0C,0x02,0x00
+};
+
+static const uint8_t bmp_arrow_right_8x9[] PROGMEM = {
+  0x00,0x40,0x20,0x18,0x04,0x08,0x30,0x40,0x00
+};
+
+static const uint8_t bmp_icon_reset_16x12[] PROGMEM = {
+  0x03,0xC0,0x07,0xE0,0x18,0x30,0x18,0x18,0x30,0x0C,0x30,0x0C,0x30,0x0C,0x30,0x08,
+  0x18,0x18,0x1C,0x30,0x0F,0xE0,0x01,0x80
+};
+
+static const uint8_t bmp_icon_load_16x12[] PROGMEM = {
+  0x00,0x00,0x01,0xFF,0x02,0x01,0x7C,0x01,0x40,0x01,0x40,0x01,0x40,0x01,0x40,0x01,
+  0x40,0x01,0x40,0x01,0x40,0x01,0x7F,0xFF
+};
+
+static const uint8_t bmp_icon_warning_16x12[] PROGMEM = {
+  0x00,0x80,0x01,0x40,0x01,0x40,0x02,0xA0,0x04,0x90,0x04,0x90,0x08,0x88,0x08,0x88,
+  0x10,0x04,0x20,0x82,0x20,0x02,0x7F,0xFF
+};
+
+static const uint8_t bmp_icon_check_16x12[] PROGMEM = {
+  0x1F,0xF8,0x20,0x04,0x40,0x02,0x40,0x0A,0x40,0x12,0x40,0x22,0x48,0x22,0x44,0x42,
+  0x42,0x82,0x41,0x02,0x20,0x04,0x1F,0xF8
+};
+
+
+static void drawPText(int x, int y, PGM_P p) {
+  loadFlashText(p);
+  u8g.drawStr(x, y, uiText);
+}
+
+static void formatText(PGM_P fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf_P(uiText, sizeof(uiText), fmt, ap);
+  va_end(ap);
+}
+
+void getTxClock(char *out) {
+  const char *t = __TIME__;
+  uint32_t base = ((uint32_t)(t[0]-'0') * 10UL + (uint32_t)(t[1]-'0')) * 3600UL;
+  base += ((uint32_t)(t[3]-'0') * 10UL + (uint32_t)(t[4]-'0')) * 60UL;
+  base += ((uint32_t)(t[6]-'0') * 10UL + (uint32_t)(t[7]-'0'));
+  uint32_t nowSec = (base + millis()/1000UL) % 86400UL;
+  uint8_t hh = (uint8_t)(nowSec / 3600UL);
+  uint8_t mm = (uint8_t)((nowSec / 60UL) % 60UL);
+  snprintf_P(out, 6, PSTR("%02u:%02u"), hh, mm);
+}
+
+static const uint8_t* uiPlaneBitmap(uint8_t type) {
+  if (type == PLANE_WING) return bmp_plane_wing_48x27;
+  if (type == PLANE_V_TAIL) return bmp_plane_vtail_48x27;
+  return bmp_plane_norm_48x27;
+}
+
+static const uint8_t* uiDashboardAttitudeBitmap(uint8_t type, int rollCmd) {
+  // Roll command is the final transmitted control value (-100..+100), so the
+  // aircraft picture follows rates/expo/trims rather than the raw stick alone.
+  if (rollCmd < -18) {
+    if (type == PLANE_WING) return bmp_dash_plane_wing_left_48x27;
+    if (type == PLANE_V_TAIL) return bmp_dash_plane_vtail_left_48x27;
+    return bmp_dash_plane_norm_left_48x27;
+  }
+  if (rollCmd > 18) {
+    if (type == PLANE_WING) return bmp_dash_plane_wing_right_48x27;
+    if (type == PLANE_V_TAIL) return bmp_dash_plane_vtail_right_48x27;
+    return bmp_dash_plane_norm_right_48x27;
+  }
+  return uiPlaneBitmap(type);
+}
+
+static const uint8_t* uiMenuBitmap16(uint8_t index) {
+  switch (index) {
+    case 0: return bmp_menu_dash_16x12;
+    case 1: return bmp_menu_rates_16x12;
+    case 2: return bmp_menu_trim_16x12;
+    case 3: return bmp_menu_plane_16x12;
+    case 4: return bmp_menu_reverse_16x12;
+    default: return bmp_menu_save_16x12;
+  }
+}
+
+static const uint8_t* uiMenuBitmap24(uint8_t index) {
+  switch (index) {
+    case 0: return bmp_menu_dash_24x18;
+    case 1: return bmp_menu_rates_24x18;
+    case 2: return bmp_menu_trim_24x18;
+    case 3: return bmp_menu_plane_24x18;
+    case 4: return bmp_menu_reverse_24x18;
+    default: return bmp_menu_save_24x18;
+  }
+}
+
+static const uint8_t* uiSignalBitmap(uint8_t quality) {
+  if (quality >= 85U) return bmp_ui_signal4_16x8;
+  if (quality >= 60U) return bmp_ui_signal3_16x8;
+  if (quality >= 35U) return bmp_ui_signal2_16x8;
+  if (quality >= 10U) return bmp_ui_signal1_16x8;
+  return bmp_ui_signal0_16x8;
+}
+
+static void drawBitmapPanel(int x, int y, uint8_t w, uint8_t h) {
+  // Dimensions are rounded to 8-pixel tiles. The visual is entirely bitmap art.
+  if (w < 16U || h < 16U) return;
+  uint8_t cols = w / 8U;
+  uint8_t rows = h / 8U;
+  if (cols < 2U || rows < 2U) return;
+  u8g.drawBitmapP(x, y, 1, 8, bmp_panel_tl_8x8);
+  u8g.drawBitmapP(x + w - 8, y, 1, 8, bmp_panel_tr_8x8);
+  u8g.drawBitmapP(x, y + h - 8, 1, 8, bmp_panel_bl_8x8);
+  u8g.drawBitmapP(x + w - 8, y + h - 8, 1, 8, bmp_panel_br_8x8);
+  for (uint8_t c = 1U; c + 1U < cols; c++) {
+    u8g.drawBitmapP(x + c * 8, y, 1, 8, bmp_panel_top_8x8);
+    u8g.drawBitmapP(x + c * 8, y + h - 8, 1, 8, bmp_panel_bottom_8x8);
+  }
+  for (uint8_t r = 1U; r + 1U < rows; r++) {
+    u8g.drawBitmapP(x, y + r * 8, 1, 8, bmp_panel_left_8x8);
+    u8g.drawBitmapP(x + w - 8, y + r * 8, 1, 8, bmp_panel_right_8x8);
+  }
+}
+
+static void drawBitmapRow(int x, int y, uint8_t w) {
+  if (w < 16U) return;
+  uint8_t cols = w / 8U;
+  u8g.drawBitmapP(x, y, 1, 13, bmp_row_l_8x13);
+  for (uint8_t c = 1U; c + 1U < cols; c++)
+    u8g.drawBitmapP(x + c * 8, y, 1, 13, bmp_row_m_8x13);
+  u8g.drawBitmapP(x + w - 8, y, 1, 13, bmp_row_r_8x13);
+}
+
+static int kineticEase(int from,int to,uint32_t started,uint16_t duration) {
+  uint32_t e=(uint32_t)(millis()-started);
+  if(e>=duration) return to;
+  // Smoothstep-ish integer ease: fast start, soft landing.
+  long t=(long)e*256L/(long)duration;
+  long q=(t*t*(768L-2L*t))>>16;
+  return from + (int)(((long)(to-from)*q)>>8);
+}
+
+static void drawRoundedBitmapScroll(uint8_t index,uint8_t count,SmoothScrollState &s) {
+  if(count<=1U) return;
+  const int x=120,y=14,travel=38;
+  int target=y+((int)index*travel)/(count-1U);
+  if(!s.init){s.fromY=s.toY=target;s.started=millis();s.init=true;}
+  if(target!=s.toY){
+    s.fromY=kineticEase(s.fromY,s.toY,s.started,150U);
+    s.toY=target;s.started=millis();
+  }
+  int thumbY=kineticEase(s.fromY,s.toY,s.started,150U);
+  u8g.drawBitmapP(x,y,1,48,bmp_ui_scroll_rail_8x48);
+  u8g.drawBitmapP(x,thumbY,1,10,bmp_ui_scroll_thumb_8x10);
+}
+
+static int selectedSlideX(int8_t current,SlideState &s) {
+  if(!s.init){s.last=current;s.dir=0;s.started=millis();s.init=true;return 0;}
+  if(current!=s.last){
+    int8_t d=(current>s.last)?1:-1;
+    // Preserve natural direction through wraparound.
+    if(s.last==0 && current>2) d=-1;
+    if(current==0 && s.last>2) d=1;
+    s.dir=d;s.last=current;s.started=millis();
+  }
+  uint32_t e=(uint32_t)(millis()-s.started);
+  if(e>=150U) return 0;
+  return (int)s.dir*(10-(int)(e*10UL/150UL));
+}
+
+static void drawNarrowThrottle(int x,int y,uint8_t pct) {
+  pct=(uint8_t)constrain((int)pct,0,100);
+  u8g.drawBitmapP(x,y,1,40,bmp_dash_thr_narrow_8x40);
+  uint8_t lit=(uint8_t)((pct*9U+99U)/100U);
+  for(uint8_t i=0;i<lit;i++)u8g.drawBitmapP(x,y+35-(int)i*4,1,2,bmp_dash_thr_narrow_seg_8x2);
+}
+
+static void drawBitmapTrack56(int x, int y, int value, bool centered) {
+  u8g.drawBitmapP(x, y, 7, 7, bmp_ui_track_56x7);
+  int px;
+  if (centered) { value = constrain(value,-100,100); px = x + 28 + (value * 24) / 100; }
+  else { value = constrain(value,0,100); px = x + 3 + (value * 50) / 100; }
+  u8g.drawBitmapP(px - 3, y + 1, 1, 5, bmp_ui_cursor_8x5);
+}
+
+static void drawBitmapTrack40(int x, int y, int value, bool centered) {
+  u8g.drawBitmapP(x, y, 5, 7, bmp_ui_track_40x7);
+  int px;
+  if (centered) { value = constrain(value,-100,100); px = x + 20 + (value * 16) / 100; }
+  else { value = constrain(value,0,100); px = x + 3 + (value * 34) / 100; }
+  u8g.drawBitmapP(px - 3, y + 1, 1, 5, bmp_ui_cursor_8x5);
+}
+
+static void drawExpoCurveOnBitmap(int x, int y, uint8_t expo) {
+  u8g.drawBitmapP(x, y, 6, 38, bmp_ui_graph_48x38);
+  for (uint8_t i=0;i<=12;i++) {
+    int in=-100+i*16; if(i==12U) in=100;
+    long cubic=((long)in*in*in)/10000L;
+    int blend=(expo*(100-MIN_EXPO_LINEAR_PERCENT))/100;
+    int out=(int)(((long)in*(100-blend)+cubic*blend)/100L);
+    int px=map(in,-100,100,x+2,x+45), py=map(out,-100,100,y+35,y+2);
+    u8g.drawBitmapP(px-3,py-1,1,3,bmp_ui_dot_8x3);
+  }
+}
+
+static void drawAnimatedLiveLinkBars(int x, int y, uint8_t quality) {
+  bool live = radioConnected && telemetryReceived && ((unsigned long)(millis()-lastTelemetryReceive)<LINK_TIMEOUT);
+  if (!live) { u8g.drawBitmapP(x,y,2,8,bmp_ui_signal0_16x8); return; }
+  uint8_t shown=quality;
+  if (((millis()/360UL)&1U)==0U) {
+    if (quality>=85U) shown=60U; else if (quality>=60U) shown=35U;
+    else if (quality>=35U) shown=10U; else if (quality>=10U) shown=0U;
+  }
+  u8g.drawBitmapP(x,y,2,8,uiSignalBitmap(shown));
+}
+
+static void drawVerticalThrottleBitmap(int x, int y, uint8_t pct) {
+  pct=(uint8_t)constrain((int)pct,0,100);
+  u8g.drawBitmapP(x,y,2,40,bmp_dash_thr_frame_16x40);
+  uint8_t lit=(uint8_t)((pct*9U+99U)/100U);
+  for(uint8_t i=0;i<lit;i++) u8g.drawBitmapP(x+4,y+34-(int)i*4,1,3,bmp_dash_thr_segment_8x3);
+}
+
+static void drawHeader(PGM_P title, uint8_t page, uint8_t total) {
+  u8g.setColorIndex(1);
+  u8g.setFont(u8g_font_6x10);
+  drawPText(2,9,title);
+  u8g.setFont(u8g_font_4x6);
+  if(total>1U) { formatText(PSTR("%u/%u"),page,total); int w=u8g.getStrWidth(uiText); u8g.drawStr(94-w,7,uiText); }
+  char clk[6]; getTxClock(clk); u8g.drawStr(99,7,clk);
+}
+
+static void drawBold(int x,int y,const char* s) { u8g.drawStr(x,y,s); u8g.drawStr(x+1,y,s); }
+
+static void loadMenuShort(uint8_t i) {
+  switch(i) {
+    case 0: loadFlashText(PSTR("DASHBOARD")); break;
+    case 1: loadFlashText(PSTR("RATES/EXPO")); break;
+    case 2: loadFlashText(PSTR("TRIMS")); break;
+    case 3: loadFlashText(PSTR("PLANE/SERVO")); break;
+    case 4: loadFlashText(PSTR("SERVO REV")); break;
+    default: loadFlashText(PSTR("SAVE/RESET")); break;
+  }
+}
+
+static void drawCarouselDots(uint8_t current,uint8_t count) {
+  int start=64-(int)count*4;
+  for(uint8_t i=0;i<count;i++) u8g.drawBitmapP(start+i*8,58,1,5,i==current?bmp_dot_full_8x5:bmp_dot_empty_8x5);
+}
+
+static const char* proOutputFunction(uint8_t output) {
+  uint8_t count=planeVisibleCount();
+  for(uint8_t i=0;i<count;i++) { uint8_t id=planeLogicalId(i); if(servo_channel_map[id]==output) return planeFunctionName(i); }
+  loadFlashText(PSTR("--")); return uiText;
+}
+
+static uint8_t assignedOutputCount() {
+  uint8_t used=0,count=planeVisibleCount();
+  for(uint8_t i=0;i<count;i++) { uint8_t id=planeLogicalId(i); if(servo_channel_map[id]!=7U) used++; }
+  return used;
+}
+
+// ---------------------------------------------------------------------------
+// FUTURISTIC SIDEWAYS CAROUSEL MENU
+// ---------------------------------------------------------------------------
+void drawMenuScreen() {
+  uint8_t cur=(uint8_t)item_selected;
+  if(!menuCarouselState.init){
+    menuCarouselState.shown=cur; menuCarouselState.from=cur;
+    menuCarouselState.dir=-1; menuCarouselState.started=millis(); menuCarouselState.init=true;
+  }
+  if(cur!=menuCarouselState.shown){
+    uint8_t old=menuCarouselState.shown;
+    menuCarouselState.from=old;
+    menuCarouselState.dir=(cur==(uint8_t)((old+1U)%NUM_ITEMS))?-1:1;
+    menuCarouselState.shown=cur;
+    menuCarouselState.started=millis();
+  }
+
+  drawHeader(PSTR("SYSTEM"),cur+1U,NUM_ITEMS);
+  uint32_t e=(uint32_t)(millis()-menuCarouselState.started);
+  int travel=(e>=180U)?48:(int)(e*48UL/180UL);
+  bool moving=(e<180U && menuCarouselState.from!=cur);
+
+  // No frozen cards: the artwork itself moves through the OLED like a phone carousel.
+  if(moving){
+    int oldX=52+(int)menuCarouselState.dir*travel;
+    int newX=52-(int)menuCarouselState.dir*(48-travel);
+    u8g.drawBitmapP(oldX,18,3,18,uiMenuBitmap24(menuCarouselState.from));
+    u8g.drawBitmapP(newX,18,3,18,uiMenuBitmap24(cur));
+    u8g.drawBitmapP(59,39,1,5,bmp_motion_pulse_8x5);
+  } else {
+    uint8_t prev=(cur==0U)?NUM_ITEMS-1U:cur-1U;
+    uint8_t next=(cur+1U>=NUM_ITEMS)?0U:cur+1U;
+    u8g.drawBitmapP(4,22,2,12,uiMenuBitmap16(prev));
+    u8g.drawBitmapP(52,17,3,18,uiMenuBitmap24(cur));
+    u8g.drawBitmapP(108,22,2,12,uiMenuBitmap16(next));
+    u8g.drawBitmapP(26,23,1,9,bmp_arrow_left_8x9);
+    u8g.drawBitmapP(94,23,1,9,bmp_arrow_right_8x9);
+  }
+
+  loadMenuShort(cur);
+  u8g.setFont(u8g_font_7x13);
+  int tw=u8g.getStrWidth(uiText);
+  drawBold(64-tw/2,51,uiText);
+  drawCarouselDots(cur,NUM_ITEMS);
+}
+
+// ---------------------------------------------------------------------------
+// PRODUCTION DASHBOARD - ordered, telemetry first, bitmap graphics only.
+// ---------------------------------------------------------------------------
+void drawDashboardScreen() {
+  uint16_t mv=telemetryData.batteryMv,ca=telemetryData.currentCentiAmp;
+  uint8_t lq=telemetryReceived?telemetryData.linkQuality:linkQuality;
+  uint8_t batPct=telemetryReceived?telemetryData.batteryPercent:lastValidBatteryPerc;
+  bool fcArmed=telemetryReceived?((telemetryData.state&0x01U)!=0U):txData.toggles[0];
+  bool fcFailsafe=telemetryReceived&&((telemetryData.state&0x04U)!=0U);
+  int thr=constrain((int)map(txData.channels[2],0,4095,0,100),0,100);
+
+  // Use the FINAL transmitted channels for the moving aircraft and the readouts.
+  // This means rates, expo and trims are reflected on-screen exactly like the model sees them.
+  int ail=constrain((int)map(txData.channels[0],0,4095,-100,100),-100,100);
+  int ele=constrain((int)map(txData.channels[1],0,4095,-100,100),-100,100);
+  int rud=constrain((int)map(txData.channels[3],0,4095,-100,100),-100,100);
+
+  u8g.setColorIndex(1);u8g.setFont(u8g_font_4x6);
+
+  // Compact production status strip.
+  u8g.drawBitmapP(0,0,2,8,bmp_status_battery_16x8);
+  formatText(PSTR("%u%%"),batPct);u8g.drawStr(17,7,uiText);
+  if(mv>=1000U)formatText(PSTR("%u.%02uV"),mv/1000U,(mv%1000U)/10U);else loadFlashText(PSTR("--.--V"));
+  u8g.drawStr(35,7,uiText);
+  formatText(PSTR("%u.%02uA"),ca/100U,ca%100U);u8g.drawStr(72,7,uiText);
+  char clk[6];getTxClock(clk);u8g.drawStr(108,7,clk);
+
+  // Packets centred; live RF animation directly under the clock.
+  formatText(PSTR("PKT %lu"),(unsigned long)(telemetryData.packetCount%10000UL));
+  int pw=u8g.getStrWidth(uiText);u8g.drawStr(64-pw/2,15,uiText);
+  formatText(PSTR("%u%%"),lq);int lw=u8g.getStrWidth(uiText);u8g.drawStr(106-lw,15,uiText);
+  drawAnimatedLiveLinkBars(111,9,lq);
+
+  // Slim vertical throttle.
+  drawNarrowThrottle(2,20,(uint8_t)thr);
+  drawPText(12,25,PSTR("THR"));formatText(PSTR("%d%%"),thr);u8g.setFont(u8g_font_6x10);u8g.drawStr(12,36,uiText);
+
+  // REAL control-driven aircraft animation:
+  //   Aileron -> switches between real bank-left / level / bank-right raster sprites.
+  //   Elevator -> shifts aircraft vertically to represent pitch command.
+  //   Rudder   -> shifts aircraft horizontally to represent yaw command.
+  // The ranges are intentionally small so the plane stays centred and production-clean.
+  int pitchShift=constrain((-ele*3)/100,-3,3);
+  int yawShift=constrain((rud*3)/100,-3,3);
+  const uint8_t* attitudeBmp=uiDashboardAttitudeBitmap(plane_type,ail);
+  u8g.drawBitmapP(39+yawShift,20+pitchShift,6,27,attitudeBmp);
+
+  // Actual transmitted control values stay grouped beneath the aircraft.
+  u8g.setFont(u8g_font_4x6);
+  formatText(PSTR("AIL %+d"),ail);u8g.drawStr(28,56,uiText);
+  formatText(PSTR("ELE %+d"),ele);u8g.drawStr(61,56,uiText);
+
+  // Ordered flight-state stack.
+  u8g.setFont(u8g_font_4x6);drawPText(96,25,PSTR("MODE"));
+  if(fcFailsafe)loadFlashText(PSTR("FAIL"));else if(flightMode==MODE_STABILIZE)loadFlashText(PSTR("STAB"));else if(flightMode==MODE_ACRO)loadFlashText(PSTR("ACRO"));else loadFlashText(PSTR("MAN"));
+  u8g.setFont(u8g_font_6x10);u8g.drawStr(96,35,uiText);
+  u8g.drawBitmapP(96,39,1,8,bmp_status_lock_8x8);u8g.setFont(u8g_font_4x6);drawPText(106,46,fcArmed?PSTR("ARM"):PSTR("SAFE"));
+  u8g.drawBitmapP(96,50,1,8,bmp_status_gear_8x8);drawPText(105,57,gearDown?PSTR("DN"):PSTR("UP"));
+}
+
+void drawDualRatesScreen() {
+  drawHeader(PSTR("RATES / EXPO"),1U,1U);
+  // Open, moving data surface: bitmap gauges + bitmap graph, no static panel cages.
+  u8g.setFont(u8g_font_6x10);drawPText(3,23,PSTR("RATE"));formatText(PSTR("%u%%"),rate_value);u8g.drawStr(34,23,uiText);
+  drawBitmapTrack56(3,27,rate_value,false);
+  drawPText(3,43,PSTR("EXPO"));formatText(PSTR("%u%%"),expo_value);u8g.drawStr(34,43,uiText);
+  drawBitmapTrack56(3,47,expo_value,false);
+  drawExpoCurveOnBitmap(76,16,expo_value);
+  if(((millis()/260UL)&1U)==0U)u8g.drawBitmapP(67,29,1,5,bmp_motion_pulse_8x5);
+  u8g.setFont(u8g_font_4x6);drawPText(3,62,PSTR("UD RATE   L/R EXPO   R-DN BACK"));
+}
+
+void drawAllTrimsScreen() {
+  static const char t0[] PROGMEM="AIL";static const char t1[] PROGMEM="ELE";static const char t2[] PROGMEM="RUD";static const char t3[] PROGMEM="FLP";
+  static const char* const names[] PROGMEM={t0,t1,t2,t3};
+  int values[4]={trim_aileron,trim_elevator,trim_rudder,trim_flaps};
+  const uint8_t count=4U,ROWS=3U;int top=(int)trim_selection-1;if(top<0)top=0;if(top>(int)count-ROWS)top=count-ROWS;
+  drawHeader(PSTR("TRIMS"),trim_selection+1U,count);
+  int sx=selectedSlideX((int8_t)trim_selection,trimSlideState);
+  for(uint8_t r=0;r<ROWS;r++){
+    uint8_t i=(uint8_t)(top+r);int y=16+(int)r*15;bool sel=(i==trim_selection);int x=sel?8+sx:10;
+    if(sel)u8g.drawBitmapP(1,y,1,13,bmp_ui_focus_8x13);
+    loadFlashTable(names,i);u8g.setFont(sel?u8g_font_7x13:u8g_font_6x10);if(sel)drawBold(x,y+11,uiText);else u8g.drawStr(x,y+10,uiText);
+    formatText(PSTR("%+d"),values[i]);int w=u8g.getStrWidth(uiText);u8g.drawStr(66-w,y+10,uiText);
+    drawBitmapTrack40(72,y+2,values[i],true);
+  }
+  drawRoundedBitmapScroll(trim_selection,count,trimScrollState);
+}
+
+void drawPlaneTypeScreen() {
+  drawHeader(PSTR("AIRFRAME"),plane_type+1U,3U);
+  int sx=selectedSlideX((int8_t)plane_type,planeSlideState);
+  u8g.setFont(u8g_font_4x6);drawPText(3,20,PSTR("TYPE"));
+  u8g.setFont(u8g_font_7x13);
+  if(plane_type==PLANE_WING)drawPText(3,34,PSTR("WING"));else if(plane_type==PLANE_V_TAIL)drawPText(3,34,PSTR("V-TAIL"));else drawPText(3,34,PSTR("NORMAL"));
+  u8g.setFont(u8g_font_4x6);formatText(PSTR("MAP %u/%u"),assignedOutputCount(),planeVisibleCount());u8g.drawStr(3,47,uiText);
+  drawPText(3,58,PSTR("R-UP SERVO MAP"));
+  // Plane slides a few pixels when type changes instead of snapping inside a box.
+  u8g.drawBitmapP(72+sx,21,6,27,uiPlaneBitmap(plane_type));
+  u8g.drawBitmapP(61,28,1,9,bmp_arrow_left_8x9);u8g.drawBitmapP(120,28,1,9,bmp_arrow_right_8x9);
+}
+
+void drawServoAssignScreen() {
+  uint8_t count=planeVisibleCount();if(servo_assign_selection<0||servo_assign_selection>=count)servo_assign_selection=0;
+  const uint8_t ROWS=3U;int top=servo_assign_selection-1;if(top<0)top=0;if(top>(int)count-ROWS)top=max(0,(int)count-ROWS);
+  drawHeader(PSTR("SERVO MAP"),(uint8_t)servo_assign_selection+1U,count);
+  int sx=selectedSlideX(servo_assign_selection,mapSlideState);
+  for(uint8_t r=0;r<ROWS&&(top+r)<count;r++){
+    uint8_t vis=(uint8_t)(top+r),id=planeLogicalId(vis);int y=16+(int)r*15;bool sel=(vis==(uint8_t)servo_assign_selection);int x=sel?8+sx:10;
+    if(sel)u8g.drawBitmapP(1,y,1,13,bmp_ui_focus_8x13);
+    const char* fn=planeFunctionName(vis);u8g.setFont(sel?u8g_font_7x13:u8g_font_6x10);if(sel)drawBold(x,y+11,fn);else u8g.drawStr(x,y+10,fn);
+    const char* out=physicalOutputName((uint8_t)constrain(servo_channel_map[id],0,7));int ow=u8g.getStrWidth(out);u8g.drawStr(112-ow,y+10,out);
+  }
+  drawRoundedBitmapScroll((uint8_t)servo_assign_selection,count,mapScrollState);
+}
+
+void drawServoMixScreen() {
+  if(servo_reverse_selection<0||servo_reverse_selection>5)servo_reverse_selection=0;
+  const uint8_t count=6U,ROWS=3U;int top=servo_reverse_selection-1;if(top<0)top=0;if(top>(int)count-ROWS)top=count-ROWS;
+  drawHeader(PSTR("SERVO DIR"),(uint8_t)servo_reverse_selection+1U,count);
+  int sx=selectedSlideX(servo_reverse_selection,reverseSlideState);
+  for(uint8_t r=0;r<ROWS;r++){
+    uint8_t i=(uint8_t)(top+r);int y=16+(int)r*15;bool sel=(i==(uint8_t)servo_reverse_selection);int x=sel?8+sx:10;
+    if(sel)u8g.drawBitmapP(1,y,1,13,bmp_ui_focus_8x13);
+    formatText(PSTR("S%u"),i+1U);u8g.setFont(sel?u8g_font_7x13:u8g_font_6x10);if(sel)drawBold(x,y+11,uiText);else u8g.drawStr(x,y+10,uiText);
+    const char* fn=proOutputFunction(i);u8g.setFont(u8g_font_6x10);u8g.drawStr(31,y+10,fn);
+    loadFlashText((servo_reverse_mask&(1U<<i))?PSTR("REV"):PSTR("NORM"));int dw=u8g.getStrWidth(uiText);u8g.drawStr(112-dw,y+10,uiText);
+  }
+  drawRoundedBitmapScroll((uint8_t)servo_reverse_selection,count,reverseScrollState);
+}
+
+void drawSaveSettingsScreen() {
+  drawHeader(settings_reset_confirm?PSTR("CONFIRM RESET"):PSTR("SETTINGS"),1U,1U);
+  if(settings_reset_confirm){
+    u8g.drawBitmapP(8,25,2,12,bmp_icon_warning_16x12);u8g.setFont(u8g_font_7x13);drawPText(31,34,PSTR("RESET ALL?"));
+    u8g.setFont(u8g_font_6x10);drawPText(20,50,PSTR("YES      NO"));u8g.setFont(u8g_font_4x6);drawPText(16,61,PSTR("R-UP     R-DN"));return;
+  }
+  // Icon-led actions float in black space instead of sitting in frozen boxes.
+  u8g.drawBitmapP(8,18,2,12,bmp_menu_save_16x12);u8g.setFont(u8g_font_7x13);drawPText(31,29,PSTR("SAVE"));
+  u8g.drawBitmapP(8,39,2,12,bmp_icon_reset_16x12);drawPText(31,50,PSTR("RESET ALL"));
+  if(((millis()/350UL)&1U)==0U)u8g.drawBitmapP(104,21,1,9,bmp_arrow_right_8x9);
+  u8g.setFont(u8g_font_4x6);drawPText(74,61,PSTR("R-DN BACK"));
+}
+
+void drawBootSplashScreen() {
+  u8g.drawBitmapP(5,5,3,8,bmp_ui_xpmark_24x8);u8g.setFont(u8g_font_7x13);drawPText(35,15,PSTR("FLIGHT"));u8g.setFont(u8g_font_6x10);drawPText(37,26,PSTR("SYSTEM"));
+  int bob=((uiAnimPhase(110U)&3U)==1U)?1:0;u8g.drawBitmapP(40,30+bob,6,27,uiPlaneBitmap(plane_type));
+  uint8_t p=uiAnimPhase(100U)%10U;for(uint8_t i=0;i<10;i++)u8g.drawBitmapP(4+i*12,58,1,5,i<=p?bmp_dot_full_8x5:bmp_dot_empty_8x5);
+}
+
+void drawRadioSearchScreen() {
+  drawHeader(PSTR("RF LINK"),1U,1U);
+  u8g.drawBitmapP(8,24,2,16,bmp_rf_tower_16x16);u8g.drawBitmapP(86,20,6,27,uiPlaneBitmap(plane_type));
+  u8g.setFont(u8g_font_7x13);drawPText(31,31,PSTR("LINKING"));u8g.setFont(u8g_font_4x6);drawPText(31,42,PSTR("2.4GHz CH100"));
+  uint8_t p=uiAnimPhase(100U)%7U;for(uint8_t i=0;i<7;i++)u8g.drawBitmapP(31+i*7,48,1,5,i==p?bmp_motion_pulse_8x5:bmp_dot_empty_8x5);
+}
+
+void drawLinkReadyScreen() {
+  uint8_t lq=telemetryReceived?telemetryData.linkQuality:linkQuality;drawHeader(PSTR("RF LINK"),1U,1U);
+  u8g.drawBitmapP(8,24,2,16,bmp_rf_tower_16x16);u8g.drawBitmapP(86,20,6,27,uiPlaneBitmap(plane_type));u8g.drawBitmapP(31,18,2,12,bmp_icon_check_16x12);
+  u8g.setFont(u8g_font_7x13);drawPText(50,30,PSTR("READY"));u8g.drawBitmapP(31,35,2,8,uiSignalBitmap(lq));formatText(PSTR("%u%%"),lq);u8g.setFont(u8g_font_6x10);u8g.drawStr(50,43,uiText);
+  formatText(PSTR("PKT %lu"),(unsigned long)(telemetryData.packetCount%10000UL));u8g.setFont(u8g_font_4x6);u8g.drawStr(31,55,uiText);
+}
+
+void drawRadioBootScreen(bool ok) {
+  drawHeader(PSTR("RF CHECK"),1U,1U);u8g.drawBitmapP(13,25,2,16,bmp_rf_tower_16x16);u8g.setFont(u8g_font_7x13);drawPText(42,33,ok?PSTR("ONLINE"):PSTR("ERROR"));u8g.setFont(u8g_font_6x10);drawPText(42,47,ok?PSTR("NRF READY"):PSTR("CHECK NRF"));
+}
+
+void drawCalibrationScreen() {
+  int progress=constrain((int)telemetryData.calibrationProgress,0,100),roll=constrain((int)telemetryData.rollDeg,-45,45),pitch=constrain((int)telemetryData.pitchDeg,-30,30);
+  drawHeader(PSTR("FC CALIBRATE"),1U,1U);
+  int bob=((uiAnimPhase(90U)&3U)==1U)?1:0;u8g.drawBitmapP(4,21+bob,6,27,uiPlaneBitmap(plane_type));
+  u8g.setFont(u8g_font_6x10);drawPText(60,24,PSTR("ROLL"));formatText(PSTR("%+d"),roll);u8g.drawStr(98,24,uiText);
+  drawPText(60,40,PSTR("PITCH"));formatText(PSTR("%+d"),pitch);u8g.drawStr(98,40,uiText);
+  drawBitmapTrack56(62,49,progress,false);u8g.setFont(u8g_font_4x6);formatText(PSTR("%d%%"),progress);u8g.drawStr(104,61,uiText);
+}
+
+void drawCurrentScreenPage() {
+  if (fcImuCalibrating()) {
+    drawCalibrationScreen();
+    return;
+  }
+
+  switch (displayScreenSnapshot) {
+    case SCREEN_MENU:          drawMenuScreen(); break;
+    case SCREEN_DASHBOARD:     drawDashboardScreen(); break;
+    case SCREEN_DUAL_RATES:    drawDualRatesScreen(); break;
+    case SCREEN_ALL_TRIMS:     drawAllTrimsScreen(); break;
+    case SCREEN_PLANE_TYPE:    drawPlaneTypeScreen(); break;
+    case SCREEN_SERVO_ASSIGN:  drawServoAssignScreen(); break;
+    case SCREEN_SAVE_SETTINGS: drawSaveSettingsScreen(); break;
+    case SCREEN_SERVO_MIX:     drawServoMixScreen(); break;
+    default:                   drawMenuScreen(); break;
+  }
+}
+
+bool initDisplayHardware() {
+  displayRendering = false;
+
+  uint8_t ok = u8g.begin();
+  u8g.setColorIndex(1);
+
+  displayInitialized = (ok != 0);
+  displayLastInitAttempt = millis();
+  displayLastProgress = displayLastInitAttempt;
+  lastDisplayUpdate = displayLastInitAttempt - DISPLAY_INTERVAL;
+  return displayInitialized;
+}
+
+void drawFirstDisplayFrameBlocking() {
+  if (!displayInitialized) return;
+
+  displayScreenSnapshot = (uint8_t)current_screen;
+  u8g.firstPage();
+  do {
+    drawCurrentScreenPage();
+  } while (u8g.nextPage());
+
+  displayRendering = false;
+  displayLastProgress = millis();
+  lastDisplayUpdate = displayLastProgress;
+}
+
+void serviceDisplay() {
+
+  if (radioTxBusy) return;
+
+  unsigned long now = millis();
+
+  if (!displayInitialized) {
+    if ((unsigned long)(now - displayLastInitAttempt) >= DISPLAY_REINIT_RETRY) {
+      initDisplayHardware();
+    }
+    return;
+  }
+
+  if (displayRendering &&
+      (unsigned long)(now - displayLastProgress) > DISPLAY_FRAME_TIMEOUT) {
+    displayRendering = false;
+    displayInitialized = false;
+    displayLastInitAttempt = now - DISPLAY_REINIT_RETRY;
+    return;
+  }
+
+  if (!displayRendering) {
+    if ((unsigned long)(now - lastDisplayUpdate) < DISPLAY_INTERVAL) return;
+
+    displayScreenSnapshot = (uint8_t)current_screen;
+    displayFrameStart = now;
+    displayLastProgress = now;
+    u8g.firstPage();
+    displayRendering = true;
+  }
+
+  drawCurrentScreenPage();
+  bool morePages = u8g.nextPage();
+  displayLastProgress = millis();
+
+  if (!morePages) {
+    displayRendering = false;
+    lastDisplayUpdate = displayLastProgress;
+  }
+}
+
+const unsigned long BOOT_LOGO_TIME_MS = 2200UL;
+const unsigned long LINK_READY_TIME_MS = 1500UL;
+
+void drawBlockingAnimatedPage(void (*drawFn)(), unsigned long durationMs) {
+  if (!displayInitialized) {
+    delay(durationMs);
+    return;
+  }
+
+  unsigned long start = millis();
+  while ((unsigned long)(millis() - start) < durationMs) {
+    u8g.firstPage();
+    do { drawFn(); } while (u8g.nextPage());
+    delay(70);
+  }
+  displayRendering = false;
+  displayLastProgress = millis();
+  lastDisplayUpdate = displayLastProgress;
+}
+
+void updateStartupRadioResult(int8_t radioResult, unsigned long now) {
+  if (radioResult == 1 || radioResult == 2) {
+    linkAttempts++;
+    uint8_t packetScore = (lastRetryCount >= 10) ? 10 : (uint8_t)(100 - lastRetryCount * 9);
+    linkScoreSum += packetScore;
+    packetCount++;
+    radioConnected = true;
+    lastTelemetryTime = now;
+  } else if (radioResult == -1) {
+    linkAttempts++;
+  }
+}
+
+void serviceStartupRadioTraffic(bool drawSearch) {
+  unsigned long now = millis();
+  unsigned long nowUs = micros();
+
+  int8_t result = serviceDataTx();
+  updateStartupRadioResult(result, now);
+
+  if ((unsigned long)(nowUs - lastInputUpdateUs) >= INPUT_UPDATE_INTERVAL_US) {
+    lastInputUpdateUs = nowUs;
+    updateControlInputsFast();
+    nowUs = micros();
+  }
+
+  if (radioReady && !radioTxBusy &&
+      (unsigned long)(nowUs - lastControlSendUs) >= CONTROL_SEND_INTERVAL_US) {
+    lastControlSendUs = nowUs;
+    startDataTx();
+  }
+
+  static unsigned long lastBootDraw = 0;
+  if (displayInitialized && (unsigned long)(now - lastBootDraw) >= 85UL && !radioTxBusy) {
+    lastBootDraw = now;
+    u8g.firstPage();
+    do {
+      if (drawSearch) drawRadioSearchScreen();
+      else drawLinkReadyScreen();
+    } while (u8g.nextPage());
+  }
+}
+
+void waitForRealFcLink() {
+  radioConnected = false;
+  telemetryReceived = false;
+  lastControlSendUs = micros() - CONTROL_SEND_INTERVAL_US;
+
+  while (!radioConnected) {
+    serviceStartupRadioTraffic(true);
+  }
+}
+
+void showLinkedReadyWhileCommunicating(unsigned long durationMs) {
+  unsigned long start = millis();
+  while ((unsigned long)(millis() - start) < durationMs) {
+    serviceStartupRadioTraffic(false);
+  }
+}
+
+void setup() {
+  memset(&txData, 0, sizeof(txData));
+
+  pinMode(Toggle1, INPUT_PULLUP);
+  pinMode(Toggle2, INPUT_PULLUP);
+  pinMode(Toggle3, INPUT_PULLUP);
+  pinMode(Toggle4, INPUT_PULLUP);
+
+  softSPI_init();
+  nrf_ce_low();
+  nrf_csn_high();
+  radioConfigured = false;
+  radioReady = false;
+  radioState = RADIO_IDLE;
+  radioTxBusy = false;
+
+  lastValidBatteryPerc = 0;
+  telemetryData.batteryMv = 0;
+  telemetryData.batteryPercent = 0;
+  telemetryData.flags = 0;
+  telemetryData.packetCount = 0;
+  telemetryData.currentCentiAmp = 0;
+  telemetryData.consumedMah = 0;
+  telemetryData.linkQuality = 0;
+  telemetryData.state = 0;
+  telemetryData.rollDeg = 0;
+  telemetryData.pitchDeg = 0;
+  telemetryData.calibrationProgress = 0;
+
+  lastToggle1 = digitalRead(Toggle1) == LOW;
+  lastToggle2 = digitalRead(Toggle2) == LOW;
+  lastToggle3 = digitalRead(Toggle3) == LOW;
+  lastToggle4 = digitalRead(Toggle4) == LOW;
+
+  loadSettings();
+  loadPlaneServoMap();
+  updateControlInputsFast();
+  lastInputUpdateUs = micros();
+
+  delay(120);
+  displayLastInitAttempt = 0;
+  initDisplayHardware();
+
+  drawBlockingAnimatedPage(drawBootSplashScreen, BOOT_LOGO_TIME_MS);
+
+  radio_init();
+  delay(6);
+  radioReady = true;
+  lastControlSendUs = micros() - CONTROL_SEND_INTERVAL_US;
+
+  bool nrfOk =
+      (read_register(CONFIG) == 0x0E) &&
+      (read_register(SETUP_AW) == 0x03) &&
+      (read_register(RF_CH) == 100);
+
+  if (!nrfOk) {
+    while (1) {
+      if (displayInitialized) {
+        u8g.firstPage();
+        do { drawRadioBootScreen(false); } while (u8g.nextPage());
+      }
+      delay(100);
+    }
+  }
+
+  waitForRealFcLink();
+
+  showLinkedReadyWhileCommunicating(LINK_READY_TIME_MS);
+
+  displayRendering = false;
+  displayLastProgress = millis();
+  lastDisplayUpdate = displayLastProgress - DISPLAY_INTERVAL;
+
+  lastTelemetryTime = millis();
+  lastLinkQualityUpdate = millis();
+  drawFirstDisplayFrameBlocking();
+}
+
+void updateControlInputsFast() {
+  rawCX = readAnalogPinClean(JoyContX);
+  rawCY = readAnalogPinClean(JoyContY);
+  rawThr = readAnalogPinClean(JoySpeedX);
+  rawPot = readAnalogPinClean(POT_PIN);
+
+  uint16_t rawAileron = (uint16_t)mapJoystickToChannel(rawCX, centerX, DEADZONE_X);
+  uint16_t rawElevator = (uint16_t)mapJoystickToChannel(rawCY, centerY, DEADZONE_Y);
+
+  txData.channels[0] = applyExpoRateChannel(rawAileron);
+  txData.channels[1] = applyExpoRateChannel(rawElevator);
+
+  int trimOffsetAil = map(trim_aileron, -100, 100, -200, 200);
+  int trimOffsetEle = map(trim_elevator, -100, 100, -200, 200);
+
+  txData.channels[0] = constrain(txData.channels[0] + trimOffsetAil, 0, 4095);
+  txData.channels[1] = constrain(txData.channels[1] + trimOffsetEle, 0, 4095);
+
+  // Throttle power curve:
+  // - Keeps true idle at 0.
+  // - Reaches full command slightly before the mechanical top stop, so a pot
+  //   that does not quite reach ADC 1023 still gives the ESC a full 2000 us.
+  // - Adds a progressive mid-stick boost so 40-50% stick no longer feels
+  //   excessively weak. Full stick is still exactly 100%; no over-range is sent.
+  long throttleNorm = map(rawThr, speedMin, speedMax, 0, 1000);
+  throttleNorm = constrain(throttleNorm, 0L, 1000L);
+
+  if (throttleNorm <= 5L) {
+    throttleNorm = 0L;
+  } else if (throttleNorm >= 930L) {
+    // Top 7% of the physical pot is treated as full throttle.
+    throttleNorm = 1000L;
+  } else {
+    // Progressive boost: x + 0.5*x*(1-x).
+    // Approx: 20% stick -> 28%, 40% -> 52%, 50% -> 63%,
+    // while 100% remains 100%.
+    throttleNorm += (throttleNorm * (1000L - throttleNorm)) / 2000L;
+    if (throttleNorm > 1000L) throttleNorm = 1000L;
+  }
+
+  txData.channels[2] = (uint16_t)((throttleNorm * 4095L + 500L) / 1000L);
+
+  int potMapped = map(rawPot, potMin, potMax, 0, 4095);
+  txData.channels[6] = (uint16_t)constrain(potMapped, 0, 4095);
+
+  handleToggles();
+  readButtons();
+
+  int yawChannel = 2048;
+  if (buttonLeftLeft && !buttonLeftRight) yawChannel = 0;
+  else if (buttonLeftRight && !buttonLeftLeft) yawChannel = 4095;
+
+  int trimOffsetRud = map(trim_rudder, -100, 100, -200, 200);
+  txData.channels[3] = constrain(yawChannel + trimOffsetRud, 0, 4095);
+
+  txData.buttons[0] = buttonLeftUp;
+  txData.buttons[1] = buttonLeftLeft;
+  txData.buttons[2] = buttonLeftRight;
+  txData.buttons[3] = buttonLeftDown;
+  txData.buttons[4] = buttonRightUp;
+  txData.buttons[5] = buttonRightLeft;
+  txData.buttons[6] = buttonRightRight;
+  txData.buttons[7] = buttonRightDown;
+
+  handleMenuButtons();
+
+}
+
+void loop() {
+  int8_t radioResult = serviceDataTx();
+  unsigned long now = millis();
+
+  if (radioResult == 1 || radioResult == 2) {
+    linkAttempts++;
+    uint8_t packetScore = (lastRetryCount >= 10) ? 10 : (uint8_t)(100 - lastRetryCount * 9);
+    linkScoreSum += packetScore;
+    packetCount++;
+    radioConnected = true;
+    lastTelemetryTime = now;
+  } else if (radioResult == -1) {
+    linkAttempts++;
+    if ((unsigned long)(now - lastTelemetryTime) > LINK_TIMEOUT) {
+      radioConnected = false;
+    }
+  }
+
+  unsigned long nowUs = micros();
+
+  if ((unsigned long)(nowUs - lastInputUpdateUs) >= INPUT_UPDATE_INTERVAL_US) {
+    lastInputUpdateUs = nowUs;
+    updateControlInputsFast();
+    nowUs = micros();
+  }
+
+  if (radioReady &&
+      !radioTxBusy &&
+      (unsigned long)(nowUs - lastControlSendUs) >= CONTROL_SEND_INTERVAL_US) {
+    lastControlSendUs = nowUs;
+    startDataTx();
+    return;
+  }
+
+  if ((unsigned long)(now - lastLinkQualityUpdate) >= 500UL) {
+    lastLinkQualityUpdate = now;
+    linkQuality = linkAttempts ? (uint8_t)(linkScoreSum / linkAttempts) : 0;
+    if (!radioConnected) linkQuality = 0;
+    linkAttempts = 0;
+    linkScoreSum = 0;
+  }
+
+  if ((unsigned long)(now - lastTelemetryReceive) > 1500UL) {
+    telemetryReceived = false;
+  }
+
+  serviceDisplay();
+}
