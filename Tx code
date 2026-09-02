@@ -1075,32 +1075,28 @@ void handleMenuButtons() {
   } else if (current_screen == SCREEN_DUAL_RATES) {
 
     if (buttonLeftUp && !menu_up_pressed) {
-      rate_value += 5;
-      if (rate_value > 100) rate_value = 100;
+      rate_value = (rate_value <= 95U) ? (uint8_t)(rate_value + 5U) : 100U;
       menu_up_pressed = true;
     } else if (!buttonLeftUp) {
       menu_up_pressed = false;
     }
 
     if (buttonLeftDown && !menu_down_pressed) {
-      rate_value -= 5;
-      if (rate_value < 0) rate_value = 0;
+      rate_value = (rate_value >= 25U) ? (uint8_t)(rate_value - 5U) : 20U;
       menu_down_pressed = true;
     } else if (!buttonLeftDown) {
       menu_down_pressed = false;
     }
 
     if (buttonLeftLeft && !menu_select_pressed) {
-      expo_value -= 5;
-      if (expo_value < 0) expo_value = 0;
+      expo_value = (expo_value >= 5U) ? (uint8_t)(expo_value - 5U) : 0U;
       menu_select_pressed = true;
     } else if (!buttonLeftLeft) {
       menu_select_pressed = false;
     }
 
     if (buttonLeftRight && !menu_exit_pressed) {
-      expo_value += 5;
-      if (expo_value > 100) expo_value = 100;
+      expo_value = (expo_value <= 95U) ? (uint8_t)(expo_value + 5U) : 100U;
       menu_exit_pressed = true;
     } else if (!buttonLeftRight) {
       menu_exit_pressed = false;
